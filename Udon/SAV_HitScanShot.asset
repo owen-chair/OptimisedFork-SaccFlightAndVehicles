@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: SAV_HitScanShot
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: b97d275a64ed35a499948cf89d5b7eb8,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: d9c4e3c5d13f0fe4bad08ea7538bc14f,
     type: 2}
   udonAssembly: 
   assemblyError: 

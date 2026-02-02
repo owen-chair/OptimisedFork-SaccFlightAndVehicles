@@ -82,8 +82,8 @@ namespace SaccFlightAndVehicles
             }
 
             //Dial Stuff
-            LStickNumFuncs = Dial_Functions_L.Length;
-            RStickNumFuncs = Dial_Functions_R.Length;
+            LStickNumFuncs = Dial_Functions_L != null ? Dial_Functions_L.Length : 0;
+            RStickNumFuncs = Dial_Functions_R != null ? Dial_Functions_R.Length : 0;
             DoDialLeft = LStickNumFuncs > 1;
             DoDialRight = RStickNumFuncs > 1;
             DisableLeftDial_ = 0;
@@ -95,6 +95,7 @@ namespace SaccFlightAndVehicles
             LStickNULL = new bool[LStickNumFuncs];
             RStickNULL = new bool[RStickNumFuncs];
             int u = 0;
+            if (PassengerExtensions != null)
             foreach (UdonSharpBehaviour usb in PassengerExtensions)
             {
                 if (usb)
@@ -104,6 +105,7 @@ namespace SaccFlightAndVehicles
                 u++;
             }
             u = 0;
+            if (Dial_Functions_L != null)
             foreach (UdonSharpBehaviour usb in Dial_Functions_L)
             {
                 if (!usb) { LStickNULL[u] = true; }
@@ -114,6 +116,7 @@ namespace SaccFlightAndVehicles
                 u++;
             }
             u = 0;
+            if (Dial_Functions_R != null)
             foreach (UdonSharpBehaviour usb in Dial_Functions_R)
             {
                 if (!usb) { RStickNULL[u] = true; }
@@ -269,6 +272,7 @@ namespace SaccFlightAndVehicles
         }
         public void TellDFUNCsLR()
         {
+            if (Dial_Functions_L != null)
             for (int i = 0; i < Dial_Functions_L.Length; i++)
             {
                 if (Dial_Functions_L[i])
@@ -277,6 +281,7 @@ namespace SaccFlightAndVehicles
                     Dial_Functions_L[i].SetProgramVariable("DialPosition", i);
                 }
             }
+            if (Dial_Functions_R != null)
             for (int i = 0; i < Dial_Functions_R.Length; i++)
             {
                 if (Dial_Functions_R[i])
@@ -291,26 +296,32 @@ namespace SaccFlightAndVehicles
         {
             if (!InEditor)
             {
+                if (PassengerExtensions != null)
                 foreach (UdonSharpBehaviour EXT in PassengerExtensions)
                 { if (EXT) { if (!localPlayer.IsOwner(EXT.gameObject)) { Networking.SetOwner(localPlayer, EXT.gameObject); } } }
+                if (Dial_Functions_L != null)
                 foreach (UdonSharpBehaviour EXT in Dial_Functions_L)
                 { if (EXT) { if (!localPlayer.IsOwner(EXT.gameObject)) { Networking.SetOwner(localPlayer, EXT.gameObject); } } }
+                if (Dial_Functions_R != null)
                 foreach (UdonSharpBehaviour EXT in Dial_Functions_R)
                 { if (EXT) { if (!localPlayer.IsOwner(EXT.gameObject)) { Networking.SetOwner(localPlayer, EXT.gameObject); } } }
             }
         }
         public void SendEventToExtensions_Gunner(string eventname)
         {
+            if (PassengerExtensions != null)
             foreach (UdonSharpBehaviour EXT in PassengerExtensions)
             {
                 if (EXT)
                 { EXT.SendCustomEvent(eventname); }
             }
+            if (Dial_Functions_L != null)
             foreach (UdonSharpBehaviour EXT in Dial_Functions_L)
             {
                 if (EXT)
                 { EXT.SendCustomEvent(eventname); }
             }
+            if (Dial_Functions_R != null)
             foreach (UdonSharpBehaviour EXT in Dial_Functions_R)
             {
                 if (EXT)
@@ -322,19 +333,19 @@ namespace SaccFlightAndVehicles
             LStickSelectionLastFrame = -1;
             RStickSelectionLastFrame = -1;
             Occupied = true;
-            if (LStickNumFuncs == 1)
+            if (LStickNumFuncs == 1 && Dial_Functions_L != null && Dial_Functions_L.Length > 0 && Dial_Functions_L[0])
             {
                 LStickSelection = 0;
-                Dial_Functions_L[LStickSelection].SetProgramVariable("LeftDial", true);
-                Dial_Functions_L[LStickSelection].SetProgramVariable("DialPosition", 0);
-                Dial_Functions_L[LStickSelection].SendCustomEvent("DFUNC_Selected");
+                Dial_Functions_L[0].SetProgramVariable("LeftDial", true);
+                Dial_Functions_L[0].SetProgramVariable("DialPosition", 0);
+                Dial_Functions_L[0].SendCustomEvent("DFUNC_Selected");
             }
-            if (RStickNumFuncs == 1)
+            if (RStickNumFuncs == 1 && Dial_Functions_R != null && Dial_Functions_R.Length > 0 && Dial_Functions_R[0])
             {
                 RStickSelection = 0;
-                Dial_Functions_R[RStickSelection].SetProgramVariable("LeftDial", false);
-                Dial_Functions_R[RStickSelection].SetProgramVariable("DialPosition", 0);
-                Dial_Functions_R[RStickSelection].SendCustomEvent("DFUNC_Selected");
+                Dial_Functions_R[0].SetProgramVariable("LeftDial", false);
+                Dial_Functions_R[0].SetProgramVariable("DialPosition", 0);
+                Dial_Functions_R[0].SendCustomEvent("DFUNC_Selected");
             }
             if (RStickDisplayHighlighter) { RStickDisplayHighlighter.localRotation = Quaternion.Euler(0, 180, 0); }
             if (LStickDisplayHighlighter) { LStickDisplayHighlighter.localRotation = Quaternion.Euler(0, 180, 0); }
@@ -385,7 +396,7 @@ namespace SaccFlightAndVehicles
         }
         public void ToggleStickSelection(UdonSharpBehaviour dfunc)
         {
-            var index = Array.IndexOf(Dial_Functions_L, dfunc);
+            var index = Dial_Functions_L != null ? Array.IndexOf(Dial_Functions_L, dfunc) : -1;
             bool isLeft = index > -1;
             if (isLeft)
             {
@@ -398,7 +409,7 @@ namespace SaccFlightAndVehicles
                     LStickSelection = index;
                 }
             }
-            index = Array.IndexOf(Dial_Functions_R, dfunc);
+            index = Dial_Functions_R != null ? Array.IndexOf(Dial_Functions_R, dfunc) : -1;
             bool isRight = index > -1;
             if (isRight)
             {

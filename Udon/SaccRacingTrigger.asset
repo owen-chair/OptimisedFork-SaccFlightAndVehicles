@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: SaccRacingTrigger
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: cbdec63dedff8ab4c8d47dbbb6d3a194,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 36393c74bcd5d8e489e3ac969c689ae8,
     type: 2}
   udonAssembly: 
   assemblyError: 

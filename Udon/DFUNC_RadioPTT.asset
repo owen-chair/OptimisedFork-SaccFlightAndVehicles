@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: DFUNC_RadioPTT
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 08232fa238aafcb49a5781b036f51839,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 31d1bbd9989fb3646ae3d5f1e2b48d9e,
     type: 2}
   udonAssembly: 
   assemblyError: 

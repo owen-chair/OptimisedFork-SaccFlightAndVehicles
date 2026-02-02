@@ -13,6 +13,26 @@ namespace SaccFlightAndVehicles
         public Animator GunAnimator;
         [Tooltip("Animator bool that is true when the gun is firing")]
         public string GunFiringBoolName = "gunfiring";
+        [Tooltip("Animator bool for local-only spool animation (should NOT fire particles/sounds)")]
+        public string GunSpoolBoolName = "gunspool";
+        [Tooltip("Animator bool for local-only spool-off (wind-down) animation/sound")]
+        public string GunSpoolOffBoolName = "gunspooloff";
+        [Tooltip("Optional animator state name to jump into for spool-off timing (leave blank to not force time)")]
+        public string GunSpoolOffStateName = "";
+        [Tooltip("Animator layer index for GunSpoolOffStateName (usually 0)")]
+        public int GunSpoolOffStateLayer = 0;
+
+        [Header("Local Spool Audio (optional)")]
+        [Tooltip("Optional: if assigned, the script will seek + play this during spool-up so cancelling mid-way can transition smoothly")]
+        public AudioSource SpoolUpAudioSource;
+        [Tooltip("Optional: if assigned, the script will seek + play this during spool-off; cancel mid-spool will start it at the matching timestamp")]
+        public AudioSource SpoolOffAudioSource;
+        [Tooltip("Seconds before spool completes that the gun is allowed to actually start firing (creates overlap without audio tricks)")]
+        public float FireLeadBeforeSpoolEndSec = 0.05f;
+        [Tooltip("Seconds the trigger must be held before the gun actually fires (and syncs firing)")]
+        public float SpoolUpTimeSec = 2.256f;
+        [Tooltip("Seconds after stopping firing before the gun can fire again (local-only)")]
+        public float SpoolDownLockoutSec = 1.488f;
         [Tooltip("Desktop key for firing when selected")]
         public KeyCode FireKey = KeyCode.Space;
         [Tooltip("Desktop key for firing when not selected")]
@@ -93,10 +113,292 @@ namespace SaccFlightAndVehicles
         private bool Piloting = false;
         private Vector3 AmmoBarScaleStart;
         private Vector3[] AmmoBarScaleStarts;
+
+        [System.NonSerialized] private bool _spooling;
+        [System.NonSerialized] private float _spoolStartTime;
+        [System.NonSerialized] private bool _spoolPrevAnimBool;
+        [System.NonSerialized] private bool _spoolHasPrevAnimBool;
+
+        [System.NonSerialized] private float _spoolOffUntil;
+        [System.NonSerialized] private bool _spoolOffOn;
+        [System.NonSerialized] private bool _spoolOffPrevAnimBool;
+        [System.NonSerialized] private bool _spoolOffHasPrevAnimBool;
+
+        [System.NonSerialized] private bool _spoolUpAudioStarted;
+        [System.NonSerialized] private bool _spoolOffAudioStarted;
+        [System.NonSerialized] private bool _spoolEndPending;
+        [System.NonSerialized] private float _spoolEndAt;
+
+        private const float _AmmoSyncInterval = 0.35f;
+        private const float _AmmoSyncEps = 0.25f;
+        [System.NonSerialized] private float _nextAmmoSyncTime;
+        [System.NonSerialized] private float _lastSyncedAmmo;
+
+        // Network optimization: keep local firing responsive, but avoid spamming
+        // RequestSerialization() when click-firing.
+        // - Only serialize a STOP if the trigger has remained released for a short delay.
+        // - Coalesce multiple changes and cap firing sync rate.
+        private const float _FiringNetStopDelay = 0.15f;
+        private const float _FiringNetSyncInterval = 0.25f;
+        [System.NonSerialized] private float _nextFiringSyncTime;
+        [System.NonSerialized] private bool _stopSyncPending;
+        [System.NonSerialized] private float _stopSyncAt;
+        [System.NonSerialized] private bool _lastSerializedFiring;
+        [System.NonSerialized] private bool _firingSyncDirty;
+
+        private bool _EnsureLocalNetOwnership()
+        {
+            if (Networking.IsOwner(gameObject)) { return true; }
+            VRCPlayerApi lp = Networking.LocalPlayer;
+            if (lp == null) { return false; }
+            Networking.SetOwner(lp, gameObject);
+            bool nowOwner = Networking.IsOwner(gameObject);
+            IsOwner = nowOwner;
+            return nowOwner;
+        }
+
+        private void _MarkFiringSyncDirty()
+        {
+            _firingSyncDirty = true;
+            _TrySyncFiringNow(false);
+        }
+
+        private void _SyncFiringStartIfNeeded()
+        {
+            // If remote clients are currently "not firing", we must send a start immediately.
+            // Otherwise rapid stop/start cycles can apply damage without any visible firing on remotes.
+            if (!_EnsureLocalNetOwnership()) { return; }
+            if (_firing && !_lastSerializedFiring)
+            {
+                RequestSerialization();
+                _lastSerializedFiring = true;
+                _firingSyncDirty = false;
+                _nextFiringSyncTime = Time.time + _FiringNetSyncInterval;
+            }
+        }
+
+        private bool _AnimatorHasBoolParam(string paramName)
+        {
+            if (!GunAnimator || string.IsNullOrEmpty(paramName)) { return false; }
+            var ps = GunAnimator.parameters;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (ps[i].type == AnimatorControllerParameterType.Bool && ps[i].name == paramName)
+                { return true; }
+            }
+            return false;
+        }
+
+        private void _SetLocalSpoolAnim(bool on)
+        {
+            if (!GunAnimator) { return; }
+            if (string.IsNullOrEmpty(GunSpoolBoolName)) { return; }
+            // Don't cache this: some setups swap runtime controllers on enable/seat.
+            if (!_AnimatorHasBoolParam(GunSpoolBoolName)) { return; }
+
+            if (on)
+            {
+                if (!_spoolHasPrevAnimBool)
+                {
+                    _spoolPrevAnimBool = GunAnimator.GetBool(GunSpoolBoolName);
+                    _spoolHasPrevAnimBool = true;
+                }
+                GunAnimator.SetBool(GunSpoolBoolName, true);
+            }
+            else
+            {
+                if (_spoolHasPrevAnimBool)
+                {
+                    GunAnimator.SetBool(GunSpoolBoolName, _spoolPrevAnimBool);
+                    _spoolHasPrevAnimBool = false;
+                }
+                else
+                {
+                    GunAnimator.SetBool(GunSpoolBoolName, false);
+                }
+            }
+        }
+
+        private static void _AudioPlayFromNormalizedTime(AudioSource src, float normalized01)
+        {
+            if (!src) { return; }
+            AudioClip clip = src.clip;
+            if (!clip) { return; }
+
+            float t01 = Mathf.Clamp01(normalized01);
+
+            // Prefer sample-accurate seeking when possible.
+            int samples = clip.samples;
+            if (samples > 0)
+            {
+                int targetSamples = Mathf.Clamp(Mathf.RoundToInt(t01 * (samples - 1)), 0, samples - 1);
+                src.timeSamples = targetSamples;
+            }
+            else
+            {
+                src.time = Mathf.Clamp(t01 * clip.length, 0f, clip.length);
+            }
+
+            if (!src.isPlaying)
+            {
+                src.Play();
+            }
+        }
+
+        private static void _AudioStop(AudioSource src)
+        {
+            if (!src) { return; }
+            if (src.isPlaying)
+            {
+                src.Stop();
+            }
+        }
+
+        private void _SetLocalSpoolOffAnim(bool on)
+        {
+            if (!GunAnimator) { return; }
+            if (string.IsNullOrEmpty(GunSpoolOffBoolName)) { return; }
+            if (!_AnimatorHasBoolParam(GunSpoolOffBoolName)) { return; }
+
+            if (on)
+            {
+                if (!_spoolOffHasPrevAnimBool)
+                {
+                    _spoolOffPrevAnimBool = GunAnimator.GetBool(GunSpoolOffBoolName);
+                    _spoolOffHasPrevAnimBool = true;
+                }
+                GunAnimator.SetBool(GunSpoolOffBoolName, true);
+            }
+            else
+            {
+                if (_spoolOffHasPrevAnimBool)
+                {
+                    GunAnimator.SetBool(GunSpoolOffBoolName, _spoolOffPrevAnimBool);
+                    _spoolOffHasPrevAnimBool = false;
+                }
+                else
+                {
+                    GunAnimator.SetBool(GunSpoolOffBoolName, false);
+                }
+            }
+        }
+
+        private void _StartLocalSpoolOff(float now)
+        {
+            _StartLocalSpoolOff(now, 1f);
+        }
+
+        private void _StartLocalSpoolOff(float now, float spoolProgress01)
+        {
+            float clampedProgress = Mathf.Clamp01(spoolProgress01);
+            float lockout = Mathf.Max(0f, SpoolDownLockoutSec) * clampedProgress;
+            _spoolOffUntil = now + lockout;
+            _spoolOffOn = (SpoolDownLockoutSec > 0f) && (clampedProgress > 0f);
+
+            // Spool-off is mutually exclusive with spool-up.
+            if (_spooling)
+            {
+                _spooling = false;
+                _SetLocalSpoolAnim(false);
+            }
+
+            // Audio: cancelling during spool-up should transition smoothly to spool-off.
+            // Assumes spool-off clip is authored from full->idle.
+            _AudioStop(SpoolUpAudioSource);
+            if (_spoolOffOn)
+            {
+                _spoolOffAudioStarted = true;
+                float spoolOffStart01 = 1f - clampedProgress;
+                _AudioPlayFromNormalizedTime(SpoolOffAudioSource, spoolOffStart01);
+            }
+            else
+            {
+                _spoolOffAudioStarted = false;
+                _AudioStop(SpoolOffAudioSource);
+            }
+
+            if (_spoolOffOn)
+            {
+                _SetLocalSpoolOffAnim(true);
+                _TryJumpSpoolOffAnimToMatchProgress(clampedProgress);
+            }
+            else
+            {
+                _SetLocalSpoolOffAnim(false);
+            }
+        }
+
+        private void _TryJumpSpoolOffAnimToMatchProgress(float spoolProgress01)
+        {
+            if (!GunAnimator) { return; }
+            if (string.IsNullOrEmpty(GunSpoolOffStateName)) { return; }
+
+            // Map current spool-up progress to spool-down clip time.
+            // Assumes spool-off clip is authored from full->idle over time (start: full spool, end: idle).
+            float normalizedTime = Mathf.Clamp01(1f - Mathf.Clamp01(spoolProgress01));
+            GunAnimator.Play(GunSpoolOffStateName, GunSpoolOffStateLayer, normalizedTime);
+            // Apply immediately so pitch curves etc start at the expected point.
+            GunAnimator.Update(0f);
+        }
+
+        private void _StopLocalSpoolOff()
+        {
+            _spoolOffOn = false;
+            _spoolOffUntil = 0f;
+            _SetLocalSpoolOffAnim(false);
+            _spoolOffHasPrevAnimBool = false;
+            _spoolOffAudioStarted = false;
+            _AudioStop(SpoolOffAudioSource);
+        }
+
+        private void _TrySyncFiringNow(bool force)
+        {
+            if (!_EnsureLocalNetOwnership()) { return; }
+            if (!_firingSyncDirty && !force) { return; }
+
+            float now = Time.time;
+            if (!force && now < _nextFiringSyncTime) { return; }
+
+            if (!force && _firing == _lastSerializedFiring)
+            {
+                _firingSyncDirty = false;
+                _nextFiringSyncTime = now + _FiringNetSyncInterval;
+                return;
+            }
+
+            RequestSerialization();
+            _lastSerializedFiring = _firing;
+            _firingSyncDirty = false;
+            _nextFiringSyncTime = now + _FiringNetSyncInterval;
+        }
         public void SFEXT_L_EntityStart()
         {
             FullGunAmmoInSeconds = GunAmmoInSeconds;
             reloadspeed = FullGunAmmoInSeconds / FullReloadTimeSec;
+
+            _lastSyncedAmmo = GunAmmoInSeconds;
+            _nextAmmoSyncTime = 0f;
+
+            _lastSerializedFiring = _firing;
+            _nextFiringSyncTime = 0f;
+            _stopSyncPending = false;
+            _stopSyncAt = 0f;
+            _firingSyncDirty = false;
+
+            _spooling = false;
+            _spoolStartTime = 0f;
+            _spoolPrevAnimBool = false;
+            _spoolHasPrevAnimBool = false;
+
+            _spoolOffUntil = 0f;
+            _spoolOffOn = false;
+            _spoolOffPrevAnimBool = false;
+            _spoolOffHasPrevAnimBool = false;
+
+            _spoolUpAudioStarted = false;
+            _spoolOffAudioStarted = false;
+            _spoolEndPending = false;
+            _spoolEndAt = 0f;
 
             AmmoBarScaleStarts = new Vector3[AmmoBars.Length];
             for (int i = 0; i < AmmoBars.Length; i++)
@@ -140,6 +442,12 @@ namespace SaccFlightAndVehicles
             SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.All, nameof(Set_Unselected));
             Selected = false;
             PickupTrigger = 0;
+            _spooling = false;
+            _SetLocalSpoolAnim(false);
+            _StopLocalSpoolOff();
+            _spoolUpAudioStarted = false;
+            _AudioStop(SpoolUpAudioSource);
+            _spoolEndPending = false;
             if (_firing)
             {
                 Firing = false;
@@ -179,6 +487,13 @@ namespace SaccFlightAndVehicles
         public void SFEXT_O_PilotExit()
         {
             Piloting = false;
+            _spooling = false;
+            _SetLocalSpoolAnim(false);
+            _StopLocalSpoolOff();
+            _spoolUpAudioStarted = false;
+            _AudioStop(SpoolUpAudioSource);
+            _spoolEndPending = false;
+            _StopFiringAndSyncIfOwner();
             if (Selected) { SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.All, nameof(Set_Unselected)); }//unselect 
             Selected = false;
             if (GunDamageParticle) { GunDamageParticle.gameObject.SetActive(false); }
@@ -188,8 +503,15 @@ namespace SaccFlightAndVehicles
             if (IsOwner)
             {
                 GunAmmoInSeconds = Mathf.Min(GunAmmoInSeconds + reloadspeed, FullGunAmmoInSeconds);
-                RequestSerialization();
-                OnDeserialization();
+                // Resupply can be called very frequently; throttle serialization to reduce bandwidth.
+                float now = Time.time;
+                if (GunAmmoInSeconds >= FullGunAmmoInSeconds || (now >= _nextAmmoSyncTime && Mathf.Abs(GunAmmoInSeconds - _lastSyncedAmmo) >= _AmmoSyncEps))
+                {
+                    _lastSyncedAmmo = GunAmmoInSeconds;
+                    _nextAmmoSyncTime = now + _AmmoSyncInterval;
+                    RequestSerialization();
+                    OnDeserialization();
+                }
             }
             if (SAVControl && GunAmmoInSeconds != FullGunAmmoInSeconds)
             { EntityControl.SetProgramVariable("ReSupplied", (int)EntityControl.GetProgramVariable("ReSupplied") + 1); }
@@ -239,12 +561,127 @@ namespace SaccFlightAndVehicles
         {
             gameObject.SetActive(true);
         }
+        
         public void Set_Inactive()
         {
-            GunAnimator.SetBool(GunFiringBoolName, false);
-            Firing = false;
+            // Don't bypass firing-sync bookkeeping.
+            _StopFiringAndSyncIfOwner();
             gameObject.SetActive(false);
         }
+
+        private void _StopFiringLocal()
+        {
+            PickupTrigger = 0;
+            _spooling = false;
+            _SetLocalSpoolAnim(false);
+            _StopLocalSpoolOff();
+            _spoolUpAudioStarted = false;
+            _AudioStop(SpoolUpAudioSource);
+            _spoolEndPending = false;
+            if (GunAnimator) { GunAnimator.SetBool(GunFiringBoolName, false); }
+            if (_firing) { Firing = false; }
+            _stopSyncPending = false;
+        }
+
+        private void _StopFiringAndSyncIfOwner()
+        {
+            // If remotes last received "firing=true" but we're now false locally (e.g. stopped via Set_Inactive),
+            // we MUST serialize even if _firing is already false, otherwise others will never see the stop/start correctly.
+            bool wasDirtyLocal = _firing || PickupTrigger != 0;
+
+            _StopFiringLocal();
+
+            bool serializedMismatch = (_lastSerializedFiring != _firing);
+            if ((wasDirtyLocal || serializedMismatch) && EntityControl != null && EntityControl.IsOwner)
+            {
+                RequestSerialization();
+                _lastSerializedFiring = _firing;
+                _firingSyncDirty = false;
+                _nextFiringSyncTime = Time.time + _FiringNetSyncInterval;
+            }
+        }
+
+        void OnDisable()
+        {
+            // If disabled mid-trigger, Update/LateUpdate won't run to clear firing.
+            ResetEverything();
+        }
+
+        void OnEnable()
+        {
+            // If re-enabled while nobody is using it, ensure firing can't stay latched on.
+            // (e.g. object was disabled mid-fire, then enabled later by seat / respawn logic)
+            ResetEverything();
+            if (!Piloting && numUsers == 0)
+            {
+                _StopFiringAndSyncIfOwner();
+            }
+        }
+
+
+        public void ResetEverything()
+        {
+            if(GunAnimator != null) GunAnimator.keepAnimatorStateOnDisable = false;
+            if(GunAnimator != null) GunAnimator.enabled = false;
+            // Reset runtime state so the gun cannot come up "already firing" after enable.
+            PickupTrigger = 0;
+
+            // Local spool/firing state.
+            _spooling = false;
+            _spoolStartTime = 0f;
+            _spoolPrevAnimBool = false;
+            _spoolHasPrevAnimBool = false;
+
+            _spoolOffUntil = 0f;
+            _spoolOffOn = false;
+            _spoolOffPrevAnimBool = false;
+            _spoolOffHasPrevAnimBool = false;
+
+            _spoolUpAudioStarted = false;
+            _spoolOffAudioStarted = false;
+            _spoolEndPending = false;
+            _spoolEndAt = 0f;
+
+            // Stop any local spool audio.
+            _AudioStop(SpoolUpAudioSource);
+            _AudioStop(SpoolOffAudioSource);
+
+            // Clear network-sync bookkeeping so we don't keep pending stop/start work.
+            _stopSyncPending = false;
+            _stopSyncAt = 0f;
+            _firingSyncDirty = false;
+            _nextFiringSyncTime = 0f;
+
+            // Ensure KeepAwake isn't left incremented.
+            if (KeepingAwake && EntityControl != null && EntityControl.IsOwner)
+            {
+                KeepingAwake = false;
+                EntityControl.KeepAwake_--;
+            }
+            KeepingAwake = false;
+
+            // Force animator + local firing flag off.
+            if (GunAnimator != null)
+            {
+                GunAnimator.SetBool(GunFiringBoolName, false);
+                GunAnimator.SetBool(GunSpoolBoolName, false);
+                GunAnimator.SetBool(GunSpoolOffBoolName, false);
+                GunAnimator.SetBool(AnimBoolName, false);
+                GunAnimator.Rebind();
+                GunAnimator.Update(0f);
+            }
+
+            _firing = false;
+            Grounded = false;
+
+            if(GunAnimator != null) GunAnimator.enabled = true;
+        }
+
+        public void SFEXT_L_OnDisable()
+        {
+            _StopFiringAndSyncIfOwner();
+        }
+
         bool IsOwner;
         public void SFEXT_O_TakeOwnership()
         {
@@ -260,61 +697,238 @@ namespace SaccFlightAndVehicles
         }
         public void SFEXT_G_Explode()
         {
+            _StopFiringAndSyncIfOwner();
             GunAmmoInSeconds = FullGunAmmoInSeconds;
             if (DoAnimBool && AnimOn)
             { SetBoolOff(); }
         }
+
+        private bool _HasFireInputContext()
+        {
+            return Selected || Input.GetKey(FireNowKey) || (!inVR && DT_UseToFire);
+        }
+
+        private float _GetFireTrigger()
+        {
+            if (EntityControl.Holding || (!inVR && DT_UseToFire))
+            {
+                return PickupTrigger;
+            }
+            if (!Selected)
+            {
+                return 0f;
+            }
+            return LeftDial
+                ? Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger")
+                : Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger");
+        }
+
+        private bool _TickSpoolOffLockout(float now)
+        {
+            bool active = (SpoolDownLockoutSec > 0f) && (now < _spoolOffUntil);
+            if (active)
+            {
+                if (!_spoolOffOn)
+                {
+                    _spoolOffOn = true;
+                }
+                _SetLocalSpoolOffAnim(true);
+
+                // Lockout cancels spool-up (but does NOT start spool-off again).
+                if (_spooling)
+                {
+                    _spooling = false;
+                    _SetLocalSpoolAnim(false);
+                    _spoolUpAudioStarted = false;
+                    _AudioStop(SpoolUpAudioSource);
+                    _spoolEndPending = false;
+                }
+            }
+            else if (_spoolOffOn)
+            {
+                _spoolOffOn = false;
+                _SetLocalSpoolOffAnim(false);
+            }
+            return active;
+        }
+
+        private bool _TickSpoolUpCanFire(float now, bool fireAllowed)
+        {
+            // Default: if no spool-up configured, or already firing, just follow fireAllowed.
+            if (SpoolUpTimeSec <= 0f || _firing)
+            {
+                if (_spooling)
+                {
+                    _spooling = false;
+                    _SetLocalSpoolAnim(false);
+                    _spoolUpAudioStarted = false;
+                    _AudioStop(SpoolUpAudioSource);
+                    _spoolEndPending = false;
+                }
+                return fireAllowed;
+            }
+
+            if (fireAllowed && GunAmmoInSeconds > 0f)
+            {
+                if (!_spooling)
+                {
+                    _spooling = true;
+                    _spoolStartTime = now;
+                    _SetLocalSpoolAnim(true);
+                    _spoolUpAudioStarted = true;
+                    _AudioPlayFromNormalizedTime(SpoolUpAudioSource, 0f);
+                    _spoolEndPending = false;
+                }
+
+                float spoolElapsed = now - _spoolStartTime;
+                float lead = Mathf.Clamp(FireLeadBeforeSpoolEndSec, 0f, SpoolUpTimeSec);
+                float fireAt = Mathf.Max(0f, SpoolUpTimeSec - lead);
+                return spoolElapsed >= fireAt;
+            }
+
+            // Cancel spool-up if input released / not allowed / out of ammo.
+            if (_spooling)
+            {
+                float spoolProgress01 = 0f;
+                if (SpoolUpTimeSec > 0f)
+                {
+                    spoolProgress01 = Mathf.Clamp01((now - _spoolStartTime) / SpoolUpTimeSec);
+                }
+                _spooling = false;
+                _SetLocalSpoolAnim(false);
+                if (spoolProgress01 > 0f)
+                {
+                    _StartLocalSpoolOff(now, spoolProgress01);
+                }
+                _spoolUpAudioStarted = false;
+                _AudioStop(SpoolUpAudioSource);
+                _spoolEndPending = false;
+            }
+            return false;
+        }
+
+        private void _TickSpoolEnd(float now)
+        {
+            if (_spoolEndPending && now >= _spoolEndAt)
+            {
+                _spoolEndPending = false;
+                _SetLocalSpoolAnim(false);
+            }
+        }
+
+        private void _TickFiringSerialization(float now, bool callOnDeserializationOnStop)
+        {
+            if (_stopSyncPending && now >= _stopSyncAt && !_firing)
+            {
+                _stopSyncPending = false;
+                _MarkFiringSyncDirty();
+                _TrySyncFiringNow(true);
+                if (callOnDeserializationOnStop)
+                {
+                    OnDeserialization();
+                }
+            }
+            else
+            {
+                _TrySyncFiringNow(false);
+            }
+        }
+
         public void LateUpdate()
         {
-            if (Piloting)
+            if (!Piloting) { return; }
+
+            float now = Time.time;
+            bool spoolOffActive = _TickSpoolOffLockout(now);
+
+            bool hasInputContext = _HasFireInputContext();
+            if (hasInputContext)
             {
-                if (Selected || Input.GetKey(FireNowKey) || (!inVR && DT_UseToFire))
+                float trigger = _GetFireTrigger();
+                bool wantsFireInput = (trigger > 0.75f) || Input.GetKey(FireKey) || Input.GetKey(FireNowKey);
+
+                bool fireAllowed = wantsFireInput && (!Grounded || AllowFiringGrounded) && !spoolOffActive;
+                bool canActuallyFireNow = _TickSpoolUpCanFire(now, fireAllowed);
+
+                _TickSpoolEnd(now);
+
+                if (GunAmmoInSeconds <= 0f)
                 {
-                    float DeltaTime = Time.deltaTime;
-                    float Trigger = 0;
-                    if (EntityControl.Holding || !inVR && DT_UseToFire)
-                        Trigger = PickupTrigger;
-                    else if (Selected)
+                    if (_firing)
                     {
-                        if (LeftDial)
-                        { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger"); }
-                        else
-                        { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger"); }
+                        Firing = false;
+                        _StartLocalSpoolOff(now);
+                        _stopSyncPending = false;
+                        _MarkFiringSyncDirty();
+                        _TrySyncFiringNow(true);
                     }
-                    if ((!Grounded || AllowFiringGrounded) && ((Trigger > 0.75 || (Input.GetKey(FireKey) || Input.GetKey(FireNowKey))) && GunAmmoInSeconds > 0))
-                    {
-                        if (DisallowFireIfWind && SAVControl)
-                        {
-                            if (((Vector3)SAVControl.GetProgramVariable("FinalWind")).sqrMagnitude > 0f)
-                            { return; }
-                        }
-                        if (!_firing)
-                        {
-                            Firing = true;
-                            RequestSerialization();
-                            // EntityControl.SendEventToExtensions("SFEXT_O_GunStartFiring");
-                        }
-                        GunAmmoInSeconds = Mathf.Max(GunAmmoInSeconds - DeltaTime, 0);
-                    }
-                    else
-                    {
-                        if (_firing)
-                        {
-                            Firing = false;
-                            RequestSerialization();
-                            // EntityControl.SendEventToExtensions("SFEXT_O_GunStopFiring");
-                        }
-                    }
-                    Hud();
-                    UpdateAmmoVisuals();
                 }
-                else if (_firing)
+                else if (canActuallyFireNow)
+                {
+                    if (DisallowFireIfWind && SAVControl)
+                    {
+                        if (((Vector3)SAVControl.GetProgramVariable("FinalWind")).sqrMagnitude > 0f)
+                        { return; }
+                    }
+
+                    _stopSyncPending = false;
+                    if (!_firing)
+                    {
+                        if (_spooling)
+                        {
+                            _spooling = false;
+                            float lead = Mathf.Clamp(FireLeadBeforeSpoolEndSec, 0f, SpoolUpTimeSec);
+                            if (lead > 0f)
+                            {
+                                _spoolEndPending = true;
+                                _spoolEndAt = now + lead;
+                            }
+                            else
+                            {
+                                _spoolEndPending = false;
+                                _SetLocalSpoolAnim(false);
+                            }
+                        }
+                        if (_spoolOffOn)
+                        {
+                            _StopLocalSpoolOff();
+                        }
+                        _spoolUpAudioStarted = false;
+                        Firing = true;
+                        _stopSyncPending = false;
+                        _MarkFiringSyncDirty();
+                        _SyncFiringStartIfNeeded();
+                    }
+
+                    GunAmmoInSeconds = Mathf.Max(GunAmmoInSeconds - Time.deltaTime, 0f);
+                }
+                else
+                {
+                    if (_firing)
+                    {
+                        Firing = false;
+                        _StartLocalSpoolOff(now);
+                        _stopSyncPending = true;
+                        _stopSyncAt = now + _FiringNetStopDelay;
+                    }
+                }
+
+                _TickFiringSerialization(now, false);
+                Hud();
+                UpdateAmmoVisuals();
+            }
+            else
+            {
+                if (_firing)
                 {
                     Firing = false;
-                    RequestSerialization();
-                    OnDeserialization();
-                    // EntityControl.SendEventToExtensions("SFEXT_O_GunStopFiring");
+                    _StartLocalSpoolOff(now);
+                    _stopSyncPending = true;
+                    _stopSyncAt = now + _FiringNetStopDelay;
                 }
+
+                _spoolEndPending = false;
+                _TickFiringSerialization(now, true);
             }
         }
         private GameObject[] AAMTargets;

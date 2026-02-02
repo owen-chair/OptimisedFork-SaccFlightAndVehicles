@@ -34,6 +34,7 @@ namespace SaccFlightAndVehicles
         private bool JoyMoving;
         private float JoyOut = 0;
         private float JoyOutTarget = 0;
+        private bool Piloting;
         Quaternion VehicleRotLastFrame;
         Quaternion JoystickZeroPoint;
         private int AIRCONTROL_STRING = Animator.StringToHash("aircontrol");
@@ -148,6 +149,7 @@ namespace SaccFlightAndVehicles
         Vector3 RotForce;
         void FixedUpdate()
         {
+            if (!Piloting) { return; }
             VehicleRigidbody.AddRelativeTorque(RotForce, ForceMode.Acceleration);
         }
         public void SFEXT_O_Grounded()
@@ -226,8 +228,10 @@ namespace SaccFlightAndVehicles
             DisableJoystick();
         }
         public void SFEXT_O_PilotEnter() { RotForce = Vector3.zero; }
+        public void SFEXT_G_PilotEnter() { Piloting = true; RotForce = Vector3.zero; }
         public void SFEXT_G_PilotExit()
         {
+            Piloting = false;
             ResetAnim();
             DisableJoystick();
         }

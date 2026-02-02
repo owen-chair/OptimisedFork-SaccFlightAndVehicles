@@ -240,6 +240,17 @@ namespace SaccFlightAndVehicles
         [System.NonSerializedAttribute] public float PilotEnterTime;
         [System.NonSerializedAttribute] public bool Holding;
         [System.NonSerializedAttribute] public bool CoMSet = false;
+
+        public SkinnedMeshRenderer m_VehicleBodyRenderer;
+        public SkinnedMeshRenderer m_VehicleBodyRenderer_LOD1;
+
+        [Header("Vehicle Team Visuals")]
+        [Tooltip("Material name to tint for team coloring. Matches either exact name or name without ' (Instance)'.")]
+        public string m_TeamColorMaterialName = "SaccCar_Red";
+
+        private MaterialPropertyBlock m_TeamColorPropertyBlock;
+
+
         public void Init() { Start(); }
         private void Start()
         {
@@ -489,12 +500,14 @@ namespace SaccFlightAndVehicles
                     { EnemyEntityControl = (SaccEntity)EnemyUdonBehaviour.GetProgramVariable("EntityControl"); }
                 }
             }
-            LastAttacker = EnemyEntityControl;
+
+            if(EnemyEntityControl == null || EnemyEntityControl == this) return;
+
             LastHitDamage = damage;
             SendEventToExtensions("SFEXT_L_BulletHit");
             SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.Self, nameof(SendDamageEvent), damage, weaponType);//local
             QueueDamage(damage, weaponType);//send to others
-            if (LastAttacker && LastAttacker != this) { LastAttacker.SendEventToExtensions("SFEXT_L_DamageFeedback"); }
+            if (EnemyEntityControl && EnemyEntityControl != this) { EnemyEntityControl.SendEventToExtensions("SFEXT_L_DamageFeedback"); }
         }
         const float DAMAGESENDINTERVAL = 0.1f;
         public float QueuedDamage;
@@ -554,8 +567,20 @@ namespace SaccFlightAndVehicles
         }
         public void InVehicleControls()
         {
-            if (!(InVehicle || Using)) { return; }
-            SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+            // This method self-reschedules. If multiple code paths start it, duplicate loops can occur.
+            // Use a small gate so only one loop runs at a time and disable/enable cycles can't leave stale scheduled calls.
+            if (!_inVehicleControlsLoopActive) { return; }
+            _inVehicleControlsLoopScheduled = false;
+            if (!(InVehicle || Using))
+            {
+                _StopInVehicleControlsLoop();
+                return;
+            }
+            if (!_inVehicleControlsLoopScheduled)
+            {
+                _inVehicleControlsLoopScheduled = true;
+                SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+            }
             if (Input.GetKeyDown(KeyCode.Return))
             {
                 if (!InEditor)
@@ -664,6 +689,23 @@ namespace SaccFlightAndVehicles
                 }
             }
         }
+
+        [System.NonSerialized] private bool _inVehicleControlsLoopActive;
+        [System.NonSerialized] private bool _inVehicleControlsLoopScheduled;
+
+        private void _StartInVehicleControlsLoop()
+        {
+            _inVehicleControlsLoopActive = true;
+            if (_inVehicleControlsLoopScheduled) { return; }
+            _inVehicleControlsLoopScheduled = true;
+            SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+        }
+
+        private void _StopInVehicleControlsLoop()
+        {
+            _inVehicleControlsLoopActive = false;
+            _inVehicleControlsLoopScheduled = false;
+        }
         private float LastJumpInput = 0f;
         public override void InputJump(bool value, VRC.Udon.Common.UdonInputEventArgs args)
         {
@@ -695,6 +737,29 @@ namespace SaccFlightAndVehicles
         }
         private void OnDisable()
         {
+            // If a level root is disabled shortly after world load (game state init),
+            // make sure we don't keep any "in vehicle" state across the disable/enable.
+            // This is especially important in editor mode where Start() auto-enters the vehicle.
+            Using = false;
+            InVehicle = false;
+            Piloting = false;
+            Occupied = false;
+            PlayersInside = 0;
+
+            // Stop any self-rescheduling input loops so no stale scheduled calls survive a root toggle.
+            _StopInVehicleControlsLoop();
+
+            // Restore any enable/disable lists that depend on being in a seat.
+            EnableInVehicle_Disable();
+            DisableInVehicle_Enable();
+
+            // Clear local tags if possible.
+            if (localPlayer != null && localPlayer.IsValid())
+            {
+                if(localPlayer != null) localPlayer.SetPlayerTag("SF_LocalPiloting", "");
+                if(localPlayer != null) localPlayer.SetPlayerTag("SF_LocalInVehicle", "");
+            }
+
             SendEventToExtensions("SFEXT_L_OnDisable");
         }
         public override void OnOwnershipTransferred(VRCPlayerApi player)
@@ -778,7 +843,8 @@ namespace SaccFlightAndVehicles
             Using = true;
             Piloting = true;
             if (!InEditor) { InVR = localPlayer.IsUserInVR(); }
-            InVehicle = true; SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+            InVehicle = true;
+            _StartInVehicleControlsLoop();
             Occupied = true;
             localPlayer.SetPlayerTag("SF_LocalPiloting", "T");
             localPlayer.SetPlayerTag("SF_LocalInVehicle", "T");
@@ -810,6 +876,54 @@ namespace SaccFlightAndVehicles
             }
             SendEventToExtensions("SFEXT_O_PilotEnter");
         }
+
+        private void _PlayerEnteredDriverSeat(VRCPlayerApi player)
+        {
+            Color teamColor = Color.red;
+
+            this._ApplyTeamColorByMaterialName(this.m_VehicleBodyRenderer, teamColor);
+            this._ApplyTeamColorByMaterialName(this.m_VehicleBodyRenderer_LOD1, teamColor);
+        }
+
+        private void _ApplyTeamColorByMaterialName(Renderer renderer, Color teamColor)
+        {
+            if (renderer == null) return;
+            if (string.IsNullOrEmpty(this.m_TeamColorMaterialName)) return;
+
+            Material[] mats = renderer.sharedMaterials;
+            if (mats == null || mats.Length == 0) return;
+
+            int idx = -1;
+            for (int i = 0; i < mats.Length; i++)
+            {
+                Material m = mats[i];
+                if (m == null) continue;
+
+                // Unity often appends " (Instance)" to runtime material names.
+                string n = m.name;
+                if (n == this.m_TeamColorMaterialName)
+                {
+                    idx = i;
+                    break;
+                }
+                if (n != null && n.StartsWith(this.m_TeamColorMaterialName))
+                {
+                    idx = i;
+                    break;
+                }
+            }
+
+            if (idx < 0) return;
+
+            if (this.m_TeamColorPropertyBlock == null)
+            {
+                this.m_TeamColorPropertyBlock = new MaterialPropertyBlock();
+            }
+
+            this.m_TeamColorPropertyBlock.SetColor("_Color", teamColor);
+            renderer.SetPropertyBlock(this.m_TeamColorPropertyBlock, idx);
+        }
+        
         public void PilotEnterVehicleGlobal(VRCPlayerApi player)
         {
             PlayersInside++;
@@ -818,6 +932,7 @@ namespace SaccFlightAndVehicles
                 Occupied = true;
                 UsersName = player.displayName;
                 UsersID = player.playerId;
+                this._PlayerEnteredDriverSeat(player);
                 PilotEnterTime = Time.time;
                 player.SetPlayerTag("SF_InVehicle", "T");
                 player.SetPlayerTag("SF_IsPilot", "T");
@@ -856,7 +971,8 @@ namespace SaccFlightAndVehicles
         public void PassengerEnterVehicleLocal()
         {
             Passenger = true;
-            InVehicle = true; SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+            InVehicle = true;
+            _StartInVehicleControlsLoop();
             InVR = localPlayer.IsUserInVR();
             localPlayer.SetPlayerTag("SF_LocalInVehicle", "T");
             if (LStickDisplayHighlighter)
@@ -1035,7 +1151,7 @@ namespace SaccFlightAndVehicles
             { RStickDisplayHighlighter.localRotation = Quaternion.Euler(0, 180, 0); }
             SendEventToExtensions("SFEXT_O_OnPickup");
             SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.All, nameof(SendEvent_Pickup));
-            SendCustomEventDelayedFrames(nameof(InVehicleControls), 1);
+            _StartInVehicleControlsLoop();
         }
         public override void Interact()
         {
@@ -1274,8 +1390,16 @@ namespace SaccFlightAndVehicles
                 Rigidbody rb = GetComponent<Rigidbody>();
                 if (rb)
                 {
-                    rb.velocity = Vector3.zero;
-                    rb.angularVelocity = Vector3.zero;//editor needs this
+                    // ClientSim/respawn can momentarily leave the RB kinematic; Unity logs if we set velocities.
+                    if (!rb.isKinematic)
+                    {
+                        rb.velocity = Vector3.zero;
+                        rb.angularVelocity = Vector3.zero;//editor needs this
+                    }
+                    else
+                    {
+                        rb.Sleep();
+                    }
                     rb.position = transform.position;
                     rb.rotation = transform.rotation;
                 }

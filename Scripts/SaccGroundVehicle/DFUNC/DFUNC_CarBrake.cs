@@ -61,8 +61,105 @@ namespace SaccFlightAndVehicles
         private bool IsOwner = false;
         private float DeadZoneSize;
         private bool AnimatingBrake;
-        private float LastUpdateTime;
-        private float BrakeLast;
+        private float _nextSyncTime;
+        private float _lastSentBrakeInput;
+        private bool _hasSentBrakeInput;
+        private bool _anyOtherPlayerNearLast;
+        private float _nextNetSendTime;
+
+        private const float _BrakeDeadzone = 0.02f;
+        private const float _BrakeNetCooldownSeconds = 0.5f;
+
+        // Distance-based throttling: if there are no other players within 50m, cap update rate to 1Hz.
+        private const float _NearPlayerRadiusSqr = 50f * 50f;
+        private const float _PlayerCacheRefreshSeconds = 0.5f;
+        [System.NonSerialized] private VRCPlayerApi[] _playerCache;
+        [System.NonSerialized] private float _nextPlayerCacheRefresh;
+        [System.NonSerialized] private bool _cachedAnyOtherPlayerNear;
+
+        // UdonSharp CPU: reuse temps instead of per-frame locals.
+        private float _tmpNow;
+        private Vector3 _tmpCenter;
+        private int _tmpPlayerCount;
+        private bool _tmpAnyNear;
+        private VRCPlayerApi _tmpPlayer;
+        private Vector3 _tmpDp;
+        private int _i;
+        private float _tmpTrigger;
+        private float _tmpVRBrakeInput;
+        private float _tmpKeyboardBrakeInput;
+        private float _tmpNewBrake;
+
+        private void _UpdateAnyOtherPlayerNearCache(Vector3 center)
+        {
+            _tmpNow = Time.time;
+            if (_tmpNow < _nextPlayerCacheRefresh) { return; }
+            _nextPlayerCacheRefresh = _tmpNow + _PlayerCacheRefreshSeconds;
+
+            _tmpPlayerCount = VRCPlayerApi.GetPlayerCount();
+            if (_tmpPlayerCount <= 0)
+            {
+                _cachedAnyOtherPlayerNear = false;
+                return;
+            }
+
+            if (_playerCache == null || _playerCache.Length != _tmpPlayerCount)
+            {
+                _playerCache = new VRCPlayerApi[_tmpPlayerCount];
+            }
+
+            _playerCache = VRCPlayerApi.GetPlayers(_playerCache);
+
+            _tmpAnyNear = false;
+            for (_i = 0; _i < _playerCache.Length; _i++)
+            {
+                _tmpPlayer = _playerCache[_i];
+                if (!Utilities.IsValid(_tmpPlayer)) { continue; }
+                // Owner tick / sync runs on the owner; ignore local player.
+                if (_tmpPlayer.isLocal) { continue; }
+
+                _tmpDp = _tmpPlayer.GetPosition() - center;
+                if (_tmpDp.sqrMagnitude <= _NearPlayerRadiusSqr)
+                {
+                    _tmpAnyNear = true;
+                    break;
+                }
+            }
+            _cachedAnyOtherPlayerNear = _tmpAnyNear;
+        }
+
+        private void _MaybeRequestSerialization(float brakeInput)
+        {
+            if (!IsOwner) { return; }
+            _tmpNow = Time.time;
+
+            // Visual-only networking: if nobody is nearby, do not sync at all.
+            if (!_cachedAnyOtherPlayerNear)
+            {
+                _anyOtherPlayerNearLast = false;
+                return;
+            }
+
+            bool becameNear = !_anyOtherPlayerNearLast;
+            _anyOtherPlayerNearLast = true;
+
+            float prev = _hasSentBrakeInput ? _lastSentBrakeInput : 0f;
+            bool wasBraking = prev > 0f;
+            bool isBraking = brakeInput > 0f;
+            bool edge = (wasBraking != isBraking);
+
+            // If someone just came into range, push the current state once.
+            if (becameNear) { edge = true; }
+
+            if (!edge) { return; }
+            if (_tmpNow < _nextNetSendTime) { return; }
+            _nextNetSendTime = _tmpNow + _BrakeNetCooldownSeconds;
+
+            RequestSerialization();
+            _hasSentBrakeInput = true;
+            _lastSentBrakeInput = brakeInput;
+            _nextSyncTime = _tmpNow + _BrakeNetCooldownSeconds;
+        }
         [UdonSynced, System.NonSerialized, FieldChangeCallback(nameof(BrakeInput))] public float _BrakeInput;
         public float BrakeInput
         {
@@ -154,18 +251,20 @@ namespace SaccFlightAndVehicles
             Selected = false;
             SetBrakeZero();
             TurnOffOverrides();
-            LastUpdateTime = Time.time;
-            BrakeLast = BrakeInput;
-            RequestSerialization();
+            _nextSyncTime = 0f;
+            _hasSentBrakeInput = false;
+            _lastSentBrakeInput = 0f;
+            if (IsOwner) { RequestSerialization(); }
         }
         public void SFEXT_O_PilotEnter()
         {
             SetBrakeZero();
             Piloting = true;
             InVR = EntityControl.InVR;
-            LastUpdateTime = Time.time;
-            BrakeLast = BrakeInput;
-            RequestSerialization();
+            _nextSyncTime = 0f;
+            _hasSentBrakeInput = false;
+            _lastSentBrakeInput = 0f;
+            if (IsOwner) { RequestSerialization(); }
         }
         public void SFEXT_O_PilotExit()
         {
@@ -220,15 +319,19 @@ namespace SaccFlightAndVehicles
         {
             if (Piloting)
             {
+                _tmpCenter = (EntityControl != null && EntityControl.CenterOfMass != null)
+                    ? EntityControl.CenterOfMass.position
+                    : transform.position;
+                _UpdateAnyOtherPlayerNearCache(_tmpCenter);
+
                 if (!InVR || Selected)
                 {
-                    float Trigger;
                     if (LeftDial)
-                    { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger"); }
+                    { _tmpTrigger = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger"); }
                     else
-                    { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger"); }
+                    { _tmpTrigger = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger"); }
 
-                    float VRBrakeInput = Trigger;
+                    _tmpVRBrakeInput = _tmpTrigger;
                     /*         if (VRBrakeInput > LowerDeadZone)
                             {
                                 float normalizedInput = Mathf.Min((VRBrakeInput - LowerDeadZone) * (1 / (VRBrakeInput - DeadZoneSize)), 1);
@@ -241,14 +344,16 @@ namespace SaccFlightAndVehicles
                     // if (VRBrakeInput < LowerDeadZone)
                     // { VRBrakeInput = 0f; }
 
-                    float KeyboardBrakeInput = 0;
+                    _tmpKeyboardBrakeInput = 0f;
 
                     if (Input.GetKey(KeyboardControl))
                     {
-                        KeyboardBrakeInput = KeyboardBrakeMulti;
+                        _tmpKeyboardBrakeInput = KeyboardBrakeMulti;
                     }
                     // if (VRBrakeInput < .1f) { VRBrakeInput = 0f; }//deadzone so there isnt constant brake applied
-                    BrakeInput = Mathf.Max(VRBrakeInput, KeyboardBrakeInput);
+                    _tmpNewBrake = Mathf.Max(_tmpVRBrakeInput, _tmpKeyboardBrakeInput);
+                    if (_tmpNewBrake < _BrakeDeadzone) { _tmpNewBrake = 0f; }
+                    BrakeInput = _tmpNewBrake;
                     if (BrakeInput > 0f)
                     {
                         TurnOnOverrides();
@@ -268,27 +373,19 @@ namespace SaccFlightAndVehicles
 #endif
                     if (DoFrontWheelBrakes)
                     {
-                        for (int i = 0; i < BrakeWheels_Front.Length; i++)
+                        for (_i = 0; _i < BrakeWheels_Front.Length; _i++)
                         {
-                            BrakeWheels_Front[i].SetProgramVariable(Brake_VariableName, BrakeInput * Brake_FrontStrengthMulti);
+                            BrakeWheels_Front[_i].SetProgramVariable(Brake_VariableName, BrakeInput * Brake_FrontStrengthMulti);
                         }
                     }
                     if (DoBackWheelBrakes)
                     {
-                        for (int i = 0; i < BrakeWheels_Back.Length; i++)
+                        for (_i = 0; _i < BrakeWheels_Back.Length; _i++)
                         {
-                            BrakeWheels_Back[i].SetProgramVariable(Brake_VariableName, BrakeInput * Brake_BackStrengthMulti);
+                            BrakeWheels_Back[_i].SetProgramVariable(Brake_VariableName, BrakeInput * Brake_BackStrengthMulti);
                         }
                     }
-                    if (Time.time - LastUpdateTime > 0.3f)
-                    {
-                        if (BrakeInput != BrakeLast)
-                        {
-                            LastUpdateTime = Time.time;
-                            BrakeLast = BrakeInput;
-                            RequestSerialization();
-                        }
-                    }
+                    _MaybeRequestSerialization(BrakeInput);
                 }
             }
         }

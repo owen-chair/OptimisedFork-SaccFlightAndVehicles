@@ -43,7 +43,7 @@ namespace SaccFlightAndVehicles
         public LayerMask HookLayers;
         public float HookStrength = 10f;
         public float MaxExtraStrByDist = 10f;
-        public float HookRange = 340f;
+        public float HookRange = 50f;
         public float SphereCastAccuracy = 0.125f;
         public AnimationCurve PullStrOverDist;
         public AudioSource HookLaunch;
@@ -365,6 +365,12 @@ namespace SaccFlightAndVehicles
         public void SFEXT_L_EntityStart()
         {
             Initialized = true;
+            if (!Hook || !HookLaunchPoint || !HookRopePoint || !Rope_Line || !RopeBasePoint)
+            {
+                Initialized = false;
+                Debug.LogError("DFUNC_Grapple null check (can remove this debug line)");
+                return;
+            }
             if (!ForceApplyPoint) { ForceApplyPoint = HookLaunchPoint; }
             VehicleRB = EntityControl.GetComponent<Rigidbody>();
             if (HandHeldRBMode_RB)
@@ -396,6 +402,7 @@ namespace SaccFlightAndVehicles
         public void LaunchHook()
         {
             if (!Initialized) { return; }
+            if (!Hook || !HookLaunchPoint || !HookRopePoint || !Rope_Line || !RopeBasePoint) { return; }
             if (AlignHookOnFire) Hook.rotation = HookLaunchPoint.rotation;
             Rope_Line.gameObject.SetActive(true);
             HookLaunchTime = Time.time;
@@ -506,10 +513,16 @@ namespace SaccFlightAndVehicles
         }
         public void ResetHook()
         {
+            if (!Hook || !Rope_Line)
+            {
+                HookAttached = false;
+                NonLocalAttached = false;
+                return;
+            }
             if (Dial_Funcon) { Dial_Funcon.SetActive(false); }
             for (int i = 0; i < Dial_Funcon_Array.Length; i++) { Dial_Funcon_Array[i].SetActive(false); }
             Rope_Line.gameObject.SetActive(false);
-            Hook.parent = HookParentStart;
+            if (HookParentStart) { Hook.parent = HookParentStart; }
             if (HookAttached)
             {
                 EntityControl.SendEventToExtensions("SFEXT_G_GrappleInactive");
@@ -863,10 +876,15 @@ namespace SaccFlightAndVehicles
         }
         public void FireHook()
         {
+            // Prevent rapid toggling/spam.
+            if (Time.time < _nextFireAllowedTime) { return; }
+            _nextFireAllowedTime = Time.time + 0.5f;
+
             HookLaunched = !HookLaunched;
             RequestSerialization();
         }
         private bool TriggerLastFrame;
+        private float _nextFireAllowedTime;
         private bool Selected;
         public void DFUNC_Selected()
         {

@@ -1,20 +1,31 @@
-# SaccFlightAndVehicles
-This is a package for VRChat containing my avatar flight script and the vehicles I've made.
-Making your own vehicles requires good knowledge of Unity. Check Instructions.txt and the wiki for more info.
+Optimised fork of github.com/Sacchan-VRC/SaccFlightAndVehicles
 
-# License
-This project is licensed under the MIT License - see the LICENSE.md file for details.
+This repo is an optimised version for quest2
 
-# Support me
-If you like my work, please consider buying me a coffee at https://ko-fi.com/sacchanvrc !
+I only wanted to use the buggy and truck so they are the only vehicles tested, others especially air vehicles might be broken in it (didn't check)
 
-## Related Projects / addons
+I forgot everything I did in it but general result is that it's much more efficient and doesn't clog the network or cause CPU spikes anymore
 
-### Open World Movement Logic by ZhakamiZhako
-https://github.com/zhakamizhako/VRCOpenWorldMovementLogic
+Most people probably wouldn't want to use this but it's here for reference
 
-### KitKat's SaccFlight addons
-https://github.com/KitKat4191/SaccFlightAddons
 
-### Esnya's SF Addons
-https://github.com/esnya/EsnyaSFAddons
+
+Optimisations include:
+- Aggressive network optimisations, reducing rates from 1kbps+ to generally 300bytes/second and 0 when stationary
+  - Lots of time gating, more smoothing, data packing, distance checks, unused vehicles arent updated
+  - much more I forgot about
+- Aggressive code CPU usage optimisations
+  - lot of stuff I can't even remember
+  - culled unneccessary updates and function calls, cached variables, cheaper calculations
+- Fixed rubberbanding when a client is laggy, and smoothing is generally better
+- Fixed network clog and CPU spikes during crashes especially with 5+ vehicles (can mush a lot of active vehicles up and it's fine now)
+- Changed shaders on the dashboard display to use less heavy ones for flat green stuff instead of full lighting ones
+- Also changed the main shader to a stripped down version of the standard lite
+- Added time gating on a lot of toggleables like horns, etc
+- Removed all dynamic lights
+- Hand turret minigun is aggressively optimised; network data is packed, spool periods prevents firing spam, angles are smoothed and update rate is lower (clicking rapidly and moving the angle a lot caused unneccessarily high data usage)
+- Added LOD groups to reduce tri count when theres lots of vehicles (mobiles can have 20+ cars now)
+  - the LODs were lazily made but it's not super obvious
+- Probably a lot more I forgot about
+
+<img width="895" height="511" alt="image" src="https://github.com/user-attachments/assets/df21c625-5adb-45b5-8667-92f9e804419a" />

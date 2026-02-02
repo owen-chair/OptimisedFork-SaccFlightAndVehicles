@@ -412,6 +412,7 @@ namespace SaccFlightAndVehicles
         [NetworkCallable]
         public void NetworkUpdateTurret_Instant(short O_RotationX, short O_RotationY, short O_RotationZ, bool Fire)
         {
+            if (!this.gameObject.activeInHierarchy) return;
             float uDelta = Time.time - L_LastUpdateTime;
             if (uDelta < 0.0001f)
             {
@@ -447,6 +448,7 @@ namespace SaccFlightAndVehicles
         [NetworkCallable]
         public void NetworkUpdateTurret(short O_RotationX, short O_RotationY, short O_RotationZ)
         {
+            if (!this.gameObject.activeInHierarchy) return;
             float uDelta = Time.time - L_LastUpdateTime;
             if (uDelta < 0.0001f)
             {

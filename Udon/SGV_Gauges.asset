@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: SGV_Gauges
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 3ca6821d42b64144c8f6ae0820c15f57,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 38de222065be78b489f3a0b94d74b0f9,
     type: 2}
   udonAssembly: 
   assemblyError: 

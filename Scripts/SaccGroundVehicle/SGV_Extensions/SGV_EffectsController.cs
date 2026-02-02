@@ -13,6 +13,12 @@ namespace SaccFlightAndVehicles
         public SaccGroundVehicle SGVControl;
         [Tooltip("Engine sounds to set pitch and doppler, DO NOT ANIMATE PITCH IN THE REVS ANIMATION")]
         public AudioSource[] EngineSounds;
+
+        [Header("Engine Audio")]
+        [Tooltip("Scales engine AudioSource volume after the Animator applies its curves. 0 = silent, 1 = unchanged.")]
+        [Range(0f, 1f)]
+        public float EngineVolumeMultiplier = 1f;
+
         bool EngineSounds_playing;
         public AudioSource[] EngineSounds_Interior;
         bool EngineSounds_Interior_playing;
@@ -298,6 +304,21 @@ namespace SaccFlightAndVehicles
             for (int i = 0; i < EngineSounds.Length; i++)
             {
                 EngineSounds[i].pitch = EngineSoundsT[i].localScale.x * Doppler;
+            }
+
+            // Animator drives engine volumes via the "Revs" clip curve (AudioSource.volume).
+            // Apply a simple post-curve multiplier here so you can lower it globally.
+            float volMul = Mathf.Clamp01(EngineVolumeMultiplier);
+            if (volMul < 0.999f)
+            {
+                for (int i = 0; i < EngineSounds.Length; i++)
+                {
+                    if (EngineSounds[i]) EngineSounds[i].volume = EngineSounds[i].volume * volMul;
+                }
+                for (int i = 0; i < EngineSounds_Interior.Length; i++)
+                {
+                    if (EngineSounds_Interior[i]) EngineSounds_Interior[i].volume = EngineSounds_Interior[i].volume * volMul;
+                }
             }
             VehicleAnimator.SetFloat(HEALTH_STRING, (float)SGVControl.GetProgramVariable("Health") * FullHealthDivider);
             VehicleAnimator.SetFloat(FUEL_STRING, (float)SGVControl.GetProgramVariable("Fuel") * FullFuelDivider);

@@ -127,20 +127,20 @@ namespace SaccFlightAndVehicles
         }
         public void RemovePlayer(VRCPlayerApi player)
         {
-            for (int i = 0; i < numPlayersInside; i++)
-            {
-                if (player == playersinside[i])
-                {
-                    playersinside[i].SetVoiceDistanceNear(0);
-                    playersinside[i].SetVoiceDistanceFar(25);
-                    playersinside[i].SetVoiceGain(15);
-                    //remove player
-                    numPlayersInside--;
-                    playersinside[i] = playersinside[numPlayersInside];
-                    playersinside[numPlayersInside] = null;
-                    break;
-                }
-            }
+            // for (int i = 0; i < numPlayersInside; i++)
+            // {
+            //     if (player == playersinside[i])
+            //     {
+            //         playersinside[i].SetVoiceDistanceNear(0);
+            //         playersinside[i].SetVoiceDistanceFar(25);
+            //         playersinside[i].SetVoiceGain(15);
+            //         //remove player
+            //         numPlayersInside--;
+            //         playersinside[i] = playersinside[numPlayersInside];
+            //         playersinside[numPlayersInside] = null;
+            //         break;
+            //     }
+            // }
         }
         private void OnDrawGizmos()
         {

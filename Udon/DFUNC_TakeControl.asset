@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: DFUNC_TakeControl
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: af3f6f6e5b22b1247b580ec27b1de98e,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 908c676cf7d9f0f48b57035b28b148e4,
     type: 2}
   udonAssembly: 
   assemblyError: 

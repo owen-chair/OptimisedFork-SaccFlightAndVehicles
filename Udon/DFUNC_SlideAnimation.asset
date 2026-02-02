@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: DFUNC_SlideAnimation
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 3b7d67207a916674da07fb4275bb9d8a,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 74081db83b6bc274a88445a9392c4b08,
     type: 2}
   udonAssembly: 
   assemblyError: 

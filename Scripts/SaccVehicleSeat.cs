@@ -99,6 +99,7 @@ namespace SaccFlightAndVehicles
                 AdjustedRot = Seat.localEulerAngles.y;//YAWCALIBRATION
             }
         }
+
         public override void OnStationEntered(VRCPlayerApi player)
         {
             if (!SeatInitialized) { InitializeSeat(); }//can't do this in start because EntityControl might not have initialized
@@ -262,15 +263,15 @@ namespace SaccFlightAndVehicles
         }
         private void SetVoiceInside(VRCPlayerApi Player)
         {
-            Player.SetVoiceDistanceNear(999999);
-            Player.SetVoiceDistanceFar(1000000);
-            Player.SetVoiceGain(.6f);
+            //Player.SetVoiceDistanceNear(999999);
+            //Player.SetVoiceDistanceFar(1000000);
+            //Player.SetVoiceGain(.6f);
         }
         private void SetVoiceOutside(VRCPlayerApi Player)
         {
-            Player.SetVoiceDistanceNear(0);
-            Player.SetVoiceDistanceFar(25);
-            Player.SetVoiceGain(15);
+            //Player.SetVoiceDistanceNear(0);
+            //Player.SetVoiceDistanceFar(25);
+            //Player.SetVoiceGain(15);
         }
         public void InitializeSeat()
         {

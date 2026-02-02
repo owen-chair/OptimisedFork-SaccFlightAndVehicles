@@ -94,28 +94,28 @@ namespace SaccFlightAndVehicles
             SAV_Radio NextRadio_R = AllRadios_RD[NextRadio];
             if (MyRadio == NextRadio_R
                 || (byte)AllRadios_RD[NextRadio].Channel != CurrentChannel
-                || CurrentChannel == 0) { return; }
-            for (int o = 0; o < NextRadio_R.RadioSeats.Length; o++)
-            {
-                if (!NextRadio_R.RadioSeats[o]) continue;
-                VRCPlayerApi thisplayer = NextRadio_R.RadioSeats[o].SeatedPlayer;
-                if (Utilities.IsValid(thisplayer))
-                {
-                    thisplayer.SetVoiceDistanceNear(VoiceNear);
-                    thisplayer.SetVoiceDistanceFar(VoiceFar);
-                    thisplayer.SetVoiceGain(VoiceGain);
-                }
-            }
-            if ((NextRadio_R.EntityControl.EntityPickup && NextRadio_R.EntityControl.EntityPickup.IsHeld) || NextRadio_R.EntityControl.CustomPickup_Synced_isHeld)
-            {
-                VRCPlayerApi thisplayer = Networking.GetOwner(NextRadio_R.gameObject);
-                if (Utilities.IsValid(thisplayer))
-                {
-                    thisplayer.SetVoiceDistanceNear(VoiceNear);
-                    thisplayer.SetVoiceDistanceFar(VoiceFar);
-                    thisplayer.SetVoiceGain(VoiceGain);
-                }
-            }
+                 || CurrentChannel == 0) { return; }
+            // for (int o = 0; o < NextRadio_R.RadioSeats.Length; o++)
+            // {
+            //     if (!NextRadio_R.RadioSeats[o]) continue;
+            //     VRCPlayerApi thisplayer = NextRadio_R.RadioSeats[o].SeatedPlayer;
+            //     if (Utilities.IsValid(thisplayer))
+            //     {
+            //         //thisplayer.SetVoiceDistanceNear(VoiceNear);
+            //         //thisplayer.SetVoiceDistanceFar(VoiceFar);
+            //         //thisplayer.SetVoiceGain(VoiceGain);
+            //     }
+            // }
+            // if ((NextRadio_R.EntityControl.EntityPickup && NextRadio_R.EntityControl.EntityPickup.IsHeld) || NextRadio_R.EntityControl.CustomPickup_Synced_isHeld)
+            // {
+            //     VRCPlayerApi thisplayer = Networking.GetOwner(NextRadio_R.gameObject);
+            //     if (Utilities.IsValid(thisplayer))
+            //     {
+            //         thisplayer.SetVoiceDistanceNear(VoiceNear);
+            //         thisplayer.SetVoiceDistanceFar(VoiceFar);
+            //         thisplayer.SetVoiceGain(VoiceGain);
+            //     }
+            // }
         }
         public void UpdateVehicle(SAV_Radio VehicleRadio)
         {
@@ -124,27 +124,27 @@ namespace SaccFlightAndVehicles
                 || !VehicleRadio
                 || (byte)VehicleRadio.Channel != CurrentChannel
                 || CurrentChannel == 0) { return; }
-            for (int o = 0; o < VehicleRadio.RadioSeats.Length; o++)
-            {
-                if (!VehicleRadio.RadioSeats[o]) continue;
-                VRCPlayerApi thisplayer = VehicleRadio.RadioSeats[o].SeatedPlayer;
-                if (Utilities.IsValid(thisplayer))
-                {
-                    thisplayer.SetVoiceDistanceNear(VoiceNear);
-                    thisplayer.SetVoiceDistanceFar(VoiceFar);
-                    thisplayer.SetVoiceGain(VoiceGain);
-                }
-            }
-            if ((VehicleRadio.EntityControl.EntityPickup && VehicleRadio.EntityControl.EntityPickup.IsHeld) || VehicleRadio.EntityControl.CustomPickup_Synced_isHeld)
-            {
-                VRCPlayerApi thisplayer = Networking.GetOwner(VehicleRadio.gameObject);
-                if (Utilities.IsValid(thisplayer))
-                {
-                    thisplayer.SetVoiceDistanceNear(VoiceNear);
-                    thisplayer.SetVoiceDistanceFar(VoiceFar);
-                    thisplayer.SetVoiceGain(VoiceGain);
-                }
-            }
+            // for (int o = 0; o < VehicleRadio.RadioSeats.Length; o++)
+            // {
+            //     if (!VehicleRadio.RadioSeats[o]) continue;
+            //     VRCPlayerApi thisplayer = VehicleRadio.RadioSeats[o].SeatedPlayer;
+            //     if (Utilities.IsValid(thisplayer))
+            //     {
+            //         thisplayer.SetVoiceDistanceNear(VoiceNear);
+            //         thisplayer.SetVoiceDistanceFar(VoiceFar);
+            //         thisplayer.SetVoiceGain(VoiceGain);
+            //     }
+            // }
+            // if ((VehicleRadio.EntityControl.EntityPickup && VehicleRadio.EntityControl.EntityPickup.IsHeld) || VehicleRadio.EntityControl.CustomPickup_Synced_isHeld)
+            // {
+            //     VRCPlayerApi thisplayer = Networking.GetOwner(VehicleRadio.gameObject);
+            //     if (Utilities.IsValid(thisplayer))
+            //     {
+            //         thisplayer.SetVoiceDistanceNear(VoiceNear);
+            //         thisplayer.SetVoiceDistanceFar(VoiceFar);
+            //         thisplayer.SetVoiceGain(VoiceGain);
+            //     }
+            // }
         }
         public void SetRadioVoiceVolumes_Zones()
         {
@@ -153,66 +153,66 @@ namespace SaccFlightAndVehicles
             if (NextZone >= NumZones) { NextZone = 0; }
             SaccRadioZone NextRZ = RadioZones[NextZone];
             VRCPlayerApi[] RZ_players = NextRZ.playersinside;
-            if (CurrentChannel != NextRZ.Channel)
-            {
-                for (int i = 0; i < NextRZ.numPlayersInside; i++)
-                {
-                    RZ_players[i].SetVoiceDistanceNear(0);
-                    RZ_players[i].SetVoiceDistanceFar(25);
-                    RZ_players[i].SetVoiceGain(15);
-                }
-                return;
-            }
-            if (NextRZ != MyZone)
-            {
-                for (int i = 0; i < NextRZ.numPlayersInside; i++)
-                {
-                    RZ_players[i].SetVoiceDistanceNear(VoiceNear);
-                    RZ_players[i].SetVoiceDistanceFar(VoiceFar);
-                    RZ_players[i].SetVoiceGain(VoiceGain);
-                }
-            }
+            // if (CurrentChannel != NextRZ.Channel)
+            // {
+            //     for (int i = 0; i < NextRZ.numPlayersInside; i++)
+            //     {
+            //         RZ_players[i].SetVoiceDistanceNear(0);
+            //         RZ_players[i].SetVoiceDistanceFar(25);
+            //         RZ_players[i].SetVoiceGain(15);
+            //     }
+            //     return;
+            // }
+            // if (NextRZ != MyZone)
+            // {
+            //     for (int i = 0; i < NextRZ.numPlayersInside; i++)
+            //     {
+            //         RZ_players[i].SetVoiceDistanceNear(VoiceNear);
+            //         RZ_players[i].SetVoiceDistanceFar(VoiceFar);
+            //         RZ_players[i].SetVoiceGain(VoiceGain);
+            //     }
+            // }
         }
         public void SetAllVoiceVolumesDefault()
         {
-            for (int i = 0; i < AllRadios_RD.Length; i++)
-            {
-                if (!AllRadios_RD[i].Initialized) continue;
-                for (int o = 0; o < AllRadios_RD[i].RadioSeats.Length; o++)
-                {
-                    if (MyRadio)
-                    {
-                        if (MyRadio.EntityControl.DoVoiceVolumeChange && AllRadios_RD[i].EntityControl == MyRadio.EntityControl) continue;
-                    }
-                    if (!AllRadios_RD[i].RadioSeats[o]) continue;
-                    VRCPlayerApi thisplayer = AllRadios_RD[i].RadioSeats[o].SeatedPlayer;
-                    if (Utilities.IsValid(thisplayer))
-                    {
-                        thisplayer.SetVoiceDistanceNear(0);
-                        thisplayer.SetVoiceDistanceFar(25);
-                        thisplayer.SetVoiceGain(15);
-                    }
-                }
-                if ((AllRadios_RD[i].EntityControl.EntityPickup && AllRadios_RD[i].EntityControl.EntityPickup.IsHeld) || AllRadios_RD[i].EntityControl.CustomPickup_Synced_isHeld)
-                {
-                    VRCPlayerApi thisplayer = Networking.GetOwner(AllRadios_RD[i].gameObject);
-                    if (Utilities.IsValid(thisplayer))
-                    {
-                        thisplayer.SetVoiceDistanceNear(0);
-                        thisplayer.SetVoiceDistanceFar(25);
-                        thisplayer.SetVoiceGain(15);
-                    }
-                }
-            }
-            for (int i = 0; i < RadioZones.Length; i++)
-            {
-                for (int o = 0; o < RadioZones[i].numPlayersInside; o++)
-                {
-                    RadioZones[i].playersinside[o].SetVoiceDistanceNear(0);
-                    RadioZones[i].playersinside[o].SetVoiceDistanceFar(25);
-                    RadioZones[i].playersinside[o].SetVoiceGain(15);
-                }
-            }
+            // for (int i = 0; i < AllRadios_RD.Length; i++)
+            // {
+            //     if (!AllRadios_RD[i].Initialized) continue;
+            //     for (int o = 0; o < AllRadios_RD[i].RadioSeats.Length; o++)
+            //     {
+            //         if (MyRadio)
+            //         {
+            //             if (MyRadio.EntityControl.DoVoiceVolumeChange && AllRadios_RD[i].EntityControl == MyRadio.EntityControl) continue;
+            //         }
+            //         if (!AllRadios_RD[i].RadioSeats[o]) continue;
+            //         VRCPlayerApi thisplayer = AllRadios_RD[i].RadioSeats[o].SeatedPlayer;
+            //         if (Utilities.IsValid(thisplayer))
+            //         {
+            //             thisplayer.SetVoiceDistanceNear(0);
+            //             thisplayer.SetVoiceDistanceFar(25);
+            //             thisplayer.SetVoiceGain(15);
+            //         }
+            //     }
+            //     if ((AllRadios_RD[i].EntityControl.EntityPickup && AllRadios_RD[i].EntityControl.EntityPickup.IsHeld) || AllRadios_RD[i].EntityControl.CustomPickup_Synced_isHeld)
+            //     {
+            //         VRCPlayerApi thisplayer = Networking.GetOwner(AllRadios_RD[i].gameObject);
+            //         if (Utilities.IsValid(thisplayer))
+            //         {
+            //             thisplayer.SetVoiceDistanceNear(0);
+            //             thisplayer.SetVoiceDistanceFar(25);
+            //             thisplayer.SetVoiceGain(15);
+            //         }
+            //     }
+            // }
+            // for (int i = 0; i < RadioZones.Length; i++)
+            // {
+            //     for (int o = 0; o < RadioZones[i].numPlayersInside; o++)
+            //     {
+            //         RadioZones[i].playersinside[o].SetVoiceDistanceNear(0);
+            //         RadioZones[i].playersinside[o].SetVoiceDistanceFar(25);
+            //         RadioZones[i].playersinside[o].SetVoiceGain(15);
+            //     }
+            // }
         }
         public void SetVehicleVolumeDefault(SAV_Radio Vehicle)
         {
@@ -224,10 +224,10 @@ namespace SaccFlightAndVehicles
         }
         public void SetSingleVoiceVolumeDefault(VRCPlayerApi player)
         {
-            if (!Utilities.IsValid(player)) { return; }
-            player.SetVoiceDistanceNear(0);
-            player.SetVoiceDistanceFar(25);
-            player.SetVoiceGain(15);
+            // if (!Utilities.IsValid(player)) { return; }
+            // player.SetVoiceDistanceNear(0);
+            // player.SetVoiceDistanceFar(25);
+            // player.SetVoiceGain(15);
         }
         public void IncreaseChannel()
         {

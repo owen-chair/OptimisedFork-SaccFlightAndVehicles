@@ -424,7 +424,11 @@ namespace SaccFlightAndVehicles
                 //find distance to player or testcamera
                 if (!InEditor)
                 {
-                    ThisFrameDist = Vector3.Distance(localPlayer.GetPosition(), CenterOfMass.position);
+                    if(localPlayer != null)
+                    {
+                        ThisFrameDist = Vector3.Distance(localPlayer.GetPosition(), CenterOfMass.position);
+                    }
+
                     if (ThisFrameDist > MaxAudibleDistance)
                     {
                         LastFrameDist = ThisFrameDist; TooFarToHear = true;

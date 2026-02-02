@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: KitKatsHMCSController
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: cb39b90e9f12186409ae4c1e55cdf698,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: b2d42ab5d2c8e1c4689fec4b8065b81f,
     type: 2}
   udonAssembly: 
   assemblyError: 

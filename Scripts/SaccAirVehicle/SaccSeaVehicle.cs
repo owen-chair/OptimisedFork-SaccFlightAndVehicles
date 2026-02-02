@@ -1249,6 +1249,19 @@ namespace SaccFlightAndVehicles
         }
         public void SetCoMMeshOffset()
         {
+            // IMPORTANT: This must be idempotent. If the object is enabled/disabled rapidly,
+            // SetCoM_ITR may not have executed yet (it's delayed), and calling this multiple
+            // times would keep shifting the mesh further each time.
+            if (_CoMMeshOffsetApplied)
+            {
+                if (!SetCoM_ITR_initialized && EntityControl.gameObject.activeInHierarchy)
+                {
+                    SendCustomEventDelayedSeconds(nameof(SetCoM_ITR), Time.fixedDeltaTime);
+                }
+                return;
+            }
+            _CoMMeshOffsetApplied = true;
+
             //move objects to so that the vehicle's main pivot is at the CoM so that syncscript's rotation is smoother
             Vector3 CoMOffset = CenterOfMass.position - VehicleTransform.position;
             int c = VehicleTransform.childCount;
@@ -1271,6 +1284,7 @@ namespace SaccFlightAndVehicles
             if (!SetCoM_ITR_initialized)
                 SetCoMMeshOffset();
         }
+        [System.NonSerialized] private bool _CoMMeshOffsetApplied;
         bool SetCoM_ITR_initialized;
         public void SetCoM_ITR()
         {

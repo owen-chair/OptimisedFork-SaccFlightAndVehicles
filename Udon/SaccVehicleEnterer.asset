@@ -12,7 +12,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
   m_Name: SaccVehicleEnterer
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 7de7932c1db349644beab31e8568bb6e,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: f91bdf396f4f24a4a885eba274116141,
     type: 2}
   udonAssembly: 
   assemblyError: 

@@ -55,7 +55,76 @@ namespace SaccFlightAndVehicles
         private bool IsOwner;
         private bool InVehicle;
         private float NextUpdateTime;
+        private float _lastSentBrakeInput;
+        private bool _hasSentBrakeInput;
+        private bool _anyOtherPlayerNearLast;
+        private float _nextNetSendTime;
         private float RotMultiMaxSpeedDivider;
+
+        private const float _BrakeDeadzone = 0.02f;
+        private const float _BrakeNetCooldownSeconds = 0.5f;
+
+        // Distance-based throttling: if there are no other players within 50m, cap update rate to 1Hz.
+        private const float _NearPlayerRadiusSqr = 50f * 50f;
+        private const float _PlayerCacheRefreshSeconds = 0.5f;
+        [System.NonSerialized] private VRCPlayerApi[] _playerCache;
+        [System.NonSerialized] private float _nextPlayerCacheRefresh;
+        [System.NonSerialized] private bool _cachedAnyOtherPlayerNear;
+
+        // UdonSharp CPU: reuse temps instead of per-frame locals.
+        private float _tmpNow;
+        private float _tmpDeltaTime;
+        private Vector3 _tmpCenter;
+        private int _tmpPlayerCount;
+        private bool _tmpAnyNear;
+        private VRCPlayerApi _tmpPlayer;
+        private Vector3 _tmpDp;
+        private int _i;
+
+        private float _tmpSpeed;
+        private Vector3 _tmpCurrentVel;
+        private bool _tmpTaxiing;
+        private float _tmpKeyboardBrakeInput;
+        private float _tmpVRBrakeInput;
+        private float _tmpTrigger;
+
+        private void _UpdateAnyOtherPlayerNearCache(Vector3 center)
+        {
+            _tmpNow = Time.time;
+            if (_tmpNow < _nextPlayerCacheRefresh) { return; }
+            _nextPlayerCacheRefresh = _tmpNow + _PlayerCacheRefreshSeconds;
+
+            _tmpPlayerCount = VRCPlayerApi.GetPlayerCount();
+            if (_tmpPlayerCount <= 0)
+            {
+                _cachedAnyOtherPlayerNear = false;
+                return;
+            }
+
+            if (_playerCache == null || _playerCache.Length != _tmpPlayerCount)
+            {
+                _playerCache = new VRCPlayerApi[_tmpPlayerCount];
+            }
+
+            _playerCache = VRCPlayerApi.GetPlayers(_playerCache);
+
+            _tmpAnyNear = false;
+            for (_i = 0; _i < _playerCache.Length; _i++)
+            {
+                _tmpPlayer = _playerCache[_i];
+                if (!Utilities.IsValid(_tmpPlayer)) { continue; }
+                // This script runs on the owner; ignore local player.
+                if (_tmpPlayer.isLocal) { continue; }
+
+                _tmpDp = _tmpPlayer.GetPosition() - center;
+                if (_tmpDp.sqrMagnitude <= _NearPlayerRadiusSqr)
+                {
+                    _tmpAnyNear = true;
+                    break;
+                }
+            }
+            _cachedAnyOtherPlayerNear = _tmpAnyNear;
+        }
         public void SFEXT_L_EntityStart()
         {
             VehicleRigidbody = EntityControl.GetComponent<Rigidbody>();
@@ -97,6 +166,8 @@ namespace SaccFlightAndVehicles
         {
             InVehicle = false;
             BrakeInput = 0;
+            _hasSentBrakeInput = false;
+            _lastSentBrakeInput = 0f;
             RequestSerialization();
             Selected = false;
             if (!NoPilotAlwaysGroundBrake)
@@ -123,6 +194,8 @@ namespace SaccFlightAndVehicles
         public void SFEXT_G_Explode()
         {
             BrakeInput = 0;
+            _hasSentBrakeInput = false;
+            _lastSentBrakeInput = 0f;
             BrakeAnimator.SetFloat(BRAKE_STRING, 0);
         }
         public void SFEXT_O_TakeOwnership()
@@ -168,36 +241,41 @@ namespace SaccFlightAndVehicles
         public void SFEXT_L_FallAsleep() { Asleep = true; }
         private void Update()
         {
-            float DeltaTime = Time.deltaTime;
+            _tmpDeltaTime = Time.deltaTime;
             if (IsOwner)
             {
                 if (!Asleep)
                 {
-                    float Speed = (float)SAVControl.GetProgramVariable("Speed");
-                    Vector3 CurrentVel = (Vector3)SAVControl.GetProgramVariable("CurrentVel");
-                    bool Taxiing = (bool)SAVControl.GetProgramVariable("Taxiing");
+                    _tmpCenter = (EntityControl != null && EntityControl.CenterOfMass != null)
+                        ? EntityControl.CenterOfMass.position
+                        : transform.position;
+                    _UpdateAnyOtherPlayerNearCache(_tmpCenter);
+
+                    _tmpSpeed = (float)SAVControl.GetProgramVariable("Speed");
+                    _tmpCurrentVel = (Vector3)SAVControl.GetProgramVariable("CurrentVel");
+                    _tmpTaxiing = (bool)SAVControl.GetProgramVariable("Taxiing");
                     if ((bool)SAVControl.GetProgramVariable("Piloting"))
                     {
-                        float KeyboardBrakeInput = 0;
-                        float VRBrakeInput = 0;
+                        _tmpKeyboardBrakeInput = 0f;
+                        _tmpVRBrakeInput = 0f;
 
                         if (Selected)
                         {
-                            float Trigger;
                             if (LeftDial)
-                            { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger"); }
+                            { _tmpTrigger = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger"); }
                             else
-                            { Trigger = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger"); }
+                            { _tmpTrigger = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger"); }
 
-                            VRBrakeInput = Trigger;
+                            _tmpVRBrakeInput = _tmpTrigger;
                         }
 
                         if (Input.GetKey(KeyboardControl))
                         {
-                            KeyboardBrakeInput = 1;
+                            _tmpKeyboardBrakeInput = 1f;
                         }
-                        BrakeInput = Mathf.Max(VRBrakeInput, KeyboardBrakeInput);
-                        if (Taxiing)
+                        BrakeInput = Mathf.Max(_tmpVRBrakeInput, _tmpKeyboardBrakeInput);
+                        if (BrakeInput < _BrakeDeadzone) { BrakeInput = 0f; }
+                        if (_tmpTaxiing)
                         {
                             //ground brake checks if vehicle is on top of a rigidbody, and if it is, brakes towards its speed rather than zero
                             //does not work if owner of vehicle does not own the rigidbody 
@@ -209,26 +287,26 @@ namespace SaccFlightAndVehicles
                                 {
                                     Vector3 speed = (VehicleRigidbody.GetPointVelocity(GroundBrakeForcePosition.position) - gdhr.velocity).normalized;
                                     speed = Vector3.ProjectOnPlane(speed, EntityControl.transform.up);
-                                    Vector3 BrakeForce = speed.normalized * BrakeInput * BrakeStrength * DeltaTime;
+                                    Vector3 BrakeForce = speed.normalized * BrakeInput * BrakeStrength * _tmpDeltaTime;
                                     if (speed.sqrMagnitude < BrakeForce.sqrMagnitude)
                                     { BrakeForce = speed; }
-                                    VehicleRigidbody.AddForceAtPosition(-speed * BrakeInput * BrakeStrength * DeltaTime, GroundBrakeForcePosition.position, ForceMode.VelocityChange);
+                                    VehicleRigidbody.AddForceAtPosition(-speed * BrakeInput * BrakeStrength * _tmpDeltaTime, GroundBrakeForcePosition.position, ForceMode.VelocityChange);
                                 }
                             }
                             else
                             {
-                                if (BrakeInput > 0 && Speed < GroundBrakeSpeed && !_DisableGroundBrake)
+                                if (BrakeInput > 0 && _tmpSpeed < GroundBrakeSpeed && !_DisableGroundBrake)
                                 {
                                     Vector3 speed = VehicleRigidbody.GetPointVelocity(GroundBrakeForcePosition.position);
                                     speed = Vector3.ProjectOnPlane(speed, EntityControl.transform.up);
-                                    Vector3 BrakeForce = speed.normalized * BrakeInput * BrakeStrength * DeltaTime;
+                                    Vector3 BrakeForce = speed.normalized * BrakeInput * BrakeStrength * _tmpDeltaTime;
                                     if (speed.sqrMagnitude < BrakeForce.sqrMagnitude)
                                     { BrakeForce = speed; }//this'll stop the vehicle exactly
                                     VehicleRigidbody.AddForceAtPosition(-BrakeForce, GroundBrakeForcePosition.position, ForceMode.VelocityChange);
                                 }
                             }
                         }
-                        if (!HasAirBrake && !(bool)SAVControl.GetProgramVariable("Taxiing"))
+                        if (!HasAirBrake && !_tmpTaxiing)
                         {
                             BrakeInput = 0;
                         }
@@ -241,28 +319,55 @@ namespace SaccFlightAndVehicles
                         SAVControl.SetProgramVariable("ExtraDrag", extradrag);
 
                         //send events to other users to tell them to enable the script so they can see the animation
-                        Braking = BrakeInput > .02f;
+                        Braking = BrakeInput > 0f;
+
+                        // Visual-only networking: if nobody is nearby, do not sync at all.
+                        if (!_cachedAnyOtherPlayerNear)
+                        {
+                            _anyOtherPlayerNearLast = false;
+                        }
+
+                        bool becameNear = _cachedAnyOtherPlayerNear && !_anyOtherPlayerNearLast;
+                        if (_cachedAnyOtherPlayerNear) { _anyOtherPlayerNearLast = true; }
+
+                        bool canNet = _cachedAnyOtherPlayerNear && (Time.time >= _nextNetSendTime);
                         if (Braking)
                         {
                             if (!BrakingLastFrame)
                             {
                                 if (Airbrake_snd && !Airbrake_snd.isPlaying) { Airbrake_snd.Play(); }
-                                SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.All, nameof(EnableForAnimation));
+                                if (canNet)
+                                {
+                                    _nextNetSendTime = Time.time + _BrakeNetCooldownSeconds;
+                                    SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.Others, nameof(EnableForAnimation));
+                                    RequestSerialization();
+                                    _hasSentBrakeInput = true;
+                                    _lastSentBrakeInput = BrakeInput;
+                                }
                             }
-                            if (Time.time > NextUpdateTime)
+
+                            // If someone just came into range while braking, push state once.
+                            if (becameNear && canNet)
                             {
+                                _nextNetSendTime = Time.time + _BrakeNetCooldownSeconds;
+                                SendCustomNetworkEvent(VRC.Udon.Common.Interfaces.NetworkEventTarget.Others, nameof(EnableForAnimation));
                                 RequestSerialization();
-                                NextUpdateTime = Time.time + .4f;
+                                _hasSentBrakeInput = true;
+                                _lastSentBrakeInput = BrakeInput;
                             }
                         }
                         else
                         {
                             if (BrakingLastFrame)
                             {
-                                float brk = BrakeInput;
                                 BrakeInput = 0;
-                                RequestSerialization();
-                                BrakeInput = brk;
+                                if (canNet)
+                                {
+                                    _nextNetSendTime = Time.time + _BrakeNetCooldownSeconds;
+                                    RequestSerialization();
+                                    _hasSentBrakeInput = true;
+                                    _lastSentBrakeInput = 0f;
+                                }
                             }
                         }
                         if (AirbrakeLerper < .03 && BrakeInput < .03)
@@ -273,7 +378,7 @@ namespace SaccFlightAndVehicles
                     }
                     else
                     {
-                        if (Taxiing)
+                        if (_tmpTaxiing)
                         {
                             //outside of vehicle, simpler version, ground brake always max
                             Rigidbody gdhr = null;
@@ -283,14 +388,14 @@ namespace SaccFlightAndVehicles
                                 float RBSpeed = ((Vector3)SAVControl.GetProgramVariable("CurrentVel") - gdhr.velocity).magnitude;
                                 if (RBSpeed < GroundBrakeSpeed && !_DisableGroundBrake)
                                 {
-                                    VehicleRigidbody.velocity = Vector3.MoveTowards(VehicleRigidbody.velocity, gdhr.GetPointVelocity(EntityControl.CenterOfMass.position), BrakeStrength * DeltaTime);
+                                    VehicleRigidbody.velocity = Vector3.MoveTowards(VehicleRigidbody.velocity, gdhr.GetPointVelocity(EntityControl.CenterOfMass.position), BrakeStrength * _tmpDeltaTime);
                                 }
                             }
                             else
                             {
-                                if (Speed < GroundBrakeSpeed && !_DisableGroundBrake)
+                                if (_tmpSpeed < GroundBrakeSpeed && !_DisableGroundBrake)
                                 {
-                                    VehicleRigidbody.velocity = Vector3.MoveTowards(VehicleRigidbody.velocity, Vector3.zero, BrakeStrength * DeltaTime);
+                                    VehicleRigidbody.velocity = Vector3.MoveTowards(VehicleRigidbody.velocity, Vector3.zero, BrakeStrength * _tmpDeltaTime);
                                 }
                             }
                         }
@@ -300,14 +405,14 @@ namespace SaccFlightAndVehicles
             else
             {
                 //this object is enabled for non-owners only while animating
-                NonLocalActiveDelay -= DeltaTime;
+                NonLocalActiveDelay -= _tmpDeltaTime;
                 if (NonLocalActiveDelay < 0 && AirbrakeLerper < 0.01)
                 {
                     DisableForAnimation();
                     return;
                 }
             }
-            AirbrakeLerper = Mathf.Lerp(AirbrakeLerper, BrakeInput, 1 - Mathf.Pow(0.5f, 2f * DeltaTime));
+            AirbrakeLerper = Mathf.Lerp(AirbrakeLerper, BrakeInput, 1 - Mathf.Pow(0.5f, 2f * _tmpDeltaTime));
             if (BrakeAnimator) { BrakeAnimator.SetFloat(BRAKE_STRING, AirbrakeLerper); }
             if (InVehicle && Airbrake_snd)
             {

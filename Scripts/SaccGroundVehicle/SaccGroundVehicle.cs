@@ -7,7 +7,7 @@ using VRC.SDK3.UdonNetworkCalling;
 namespace SaccFlightAndVehicles
 {
     [DefaultExecutionOrder(1400)]//before wheels
-    [UdonBehaviourSyncMode(BehaviourSyncMode.Continuous)]
+    [UdonBehaviourSyncMode(BehaviourSyncMode.Manual)]
     public class SaccGroundVehicle : UdonSharpBehaviour
     {
         public SaccEntity EntityControl;
@@ -31,6 +31,16 @@ namespace SaccFlightAndVehicles
         [Tooltip("All of the rest of the wheels")]
         public UdonSharpBehaviour[] OtherWheels;
         private UdonSharpBehaviour[] AllWheels;
+
+        // Cached typed wheel refs for performance.
+        // Public wheel arrays stay as UdonSharpBehaviour[] for inspector compatibility.
+        [System.NonSerialized] private SaccWheel[] _DriveWheelsTyped;
+        [System.NonSerialized] private SaccWheel[] _SteerWheelsTyped;
+        [System.NonSerialized] private SaccWheel[] _OtherWheelsTyped;
+        [System.NonSerialized] private int _DriveWheelsCount;
+        [System.NonSerialized] private int _SteerWheelsCount;
+        [System.NonSerialized] private int _OtherWheelsCount;
+        [System.NonSerialized] private bool[] _WheelIsDupBuffer;
         //public Transform[] DriveWheelsTrans;
         //public sustest[] SteeringWheels;
         //public Transform[] SteeringWheelsTrans;
@@ -174,13 +184,40 @@ namespace SaccFlightAndVehicles
         [Tooltip("Multiply how much the VR throttle moves relative to hand movement")]
         public float ThrottleSensitivity = 6f;
         [Header("Debug")]
-        [UdonSynced(UdonSyncMode.Linear)] public float Revs;
+        [UdonSynced] public float Revs;
         public float Clutch;
         public byte CurrentGear = 0;
         private bool LimitingRev = false;
         public float debugSpeedSteeringMulti = 0f;
         public bool InVR;
         public bool Sleeping = false;
+
+        [Header("Optimization")]
+        [Tooltip("When enabled, if the vehicle is unoccupied and has been at-rest for a short time, skip per-wheel physics (raycasts/forces). This is a big CPU win when many idle vehicles exist, especially for the instance master/owner.")]
+        public bool IdleAtRestOptimization = true;
+
+        [Tooltip("Seconds the vehicle must remain under the at-rest thresholds before wheel physics is skipped.")]
+        public float IdleAtRestDelay = 2.0f;
+
+        [Tooltip("Linear speed (m/s) below which the vehicle is considered at-rest.")]
+        public float IdleAtRestSpeedThreshold = 0.05f;
+
+        [Tooltip("Angular speed (rad/s) below which the vehicle is considered at-rest.")]
+        public float IdleAtRestAngularSpeedThreshold = 0.05f;
+
+        [System.NonSerialized] private float _idleAtRestSince;
+        [System.NonSerialized] private bool _idleAtRestWheelsSlept;
+
+        // UdonSharp GC-avoid: temps used in idle-at-rest FixedUpdate gating.
+        [System.NonSerialized] private Vector3 _iatroV;
+        [System.NonSerialized] private Vector3 _iatroAV;
+        [System.NonSerialized] private float _iatroVSqr;
+        [System.NonSerialized] private float _iatroAVSqr;
+        [System.NonSerialized] private float _iatroVThr;
+        [System.NonSerialized] private float _iatroAVThr;
+        [System.NonSerialized] private float _iatroVThrSqr;
+        [System.NonSerialized] private float _iatroAVThrSqr;
+        [System.NonSerialized] private float _iatroNow;
         public bool Grounded_Steering;
         public bool Grounded;
         public float GearRatio = 0f;
@@ -224,8 +261,277 @@ namespace SaccFlightAndVehicles
         [System.NonSerializedAttribute] public Vector3 LastFrameVel = Vector3.zero;
         private float FinalThrottle;
         private float AutoSteerLerper;
-        [System.NonSerializedAttribute][UdonSynced(UdonSyncMode.Linear)] public float YawInput;
-        [System.NonSerializedAttribute][UdonSynced(UdonSyncMode.Linear)] public float ThrottleInput;
+        [System.NonSerializedAttribute][UdonSynced] public float YawInput;
+        [System.NonSerializedAttribute][UdonSynced] public float ThrottleInput;
+
+        private const float _ManualSyncPilotingInterval = 0.25f;   // ~6-7Hz while actively driven
+        private const float _ManualSyncOccupiedInterval = 0.45f;   // passengers / recently used
+        private const float _ManualSyncEmptyInterval = 1.0f;      // empty vehicles
+        private const float _ManualSyncSleepingInterval = 4.20f;   // sleeping / far / inactive
+
+        private const float _SyncEpsYaw = 0.01f;
+        private const float _SyncEpsThrottle = 0.01f;
+        private const float _SyncEpsRevs = 80f;
+        private const float _SyncEpsFuel = 2.0f;
+        private const float _SyncEpsHealth = 0.1f;
+
+        private const float _FuelBucketSize = 10f;
+
+        [System.NonSerialized] private float _nextManualSyncTime;
+        [System.NonSerialized] private bool _manualSyncDirty = true;
+        [System.NonSerialized] private float _lastSyncHealth;
+        [System.NonSerialized] private float _lastSyncFuel;
+        [System.NonSerialized] private int _lastSyncFuelBucket;
+        [System.NonSerialized] private float _lastSyncRevs;
+        [System.NonSerialized] private float _lastSyncYaw;
+        [System.NonSerialized] private float _lastSyncThrottle;
+
+        // Non-owner smoothing for low-rate synced inputs.
+        // These inputs are synced relatively infrequently (manual sync), so remote clients should
+        // not drive visuals/audio directly from the stepwise network values.
+        private const float _RemoteYawHalfLifeSeconds = 0.45f;
+        private const float _RemoteThrottleHalfLifeSeconds = 0.60f;
+        private const float _RemoteRevsHalfLifeSeconds = 0.55f;
+        [System.NonSerialized] private bool _remoteInputSmoothingInitialized;
+        [System.NonSerialized] private float _remoteYawTarget;
+        [System.NonSerialized] private float _remoteThrottleTarget;
+        [System.NonSerialized] private float _remoteYawSmoothed;
+        [System.NonSerialized] private float _remoteThrottleSmoothed;
+        [System.NonSerialized] private float _remoteRevsTarget;
+        [System.NonSerialized] private float _remoteRevsSmoothed;
+
+        private void _InitRemoteInputSmoothingFromCurrent()
+        {
+            _remoteYawTarget = YawInput;
+            _remoteThrottleTarget = ThrottleInput;
+            _remoteRevsTarget = Revs;
+            _remoteYawSmoothed = _remoteYawTarget;
+            _remoteThrottleSmoothed = _remoteThrottleTarget;
+            _remoteRevsSmoothed = _remoteRevsTarget;
+            _remoteInputSmoothingInitialized = true;
+        }
+
+        private void _UpdateRemoteInputSmoothing(float deltaTime)
+        {
+            if (!_remoteInputSmoothingInitialized)
+            {
+                _InitRemoteInputSmoothingFromCurrent();
+            }
+            if (deltaTime <= 0f) { return; }
+
+            _risYawT = 1f - Mathf.Pow(0.5f, deltaTime / _RemoteYawHalfLifeSeconds);
+            _risThrottleT = 1f - Mathf.Pow(0.5f, deltaTime / _RemoteThrottleHalfLifeSeconds);
+            _risRevsT = 1f - Mathf.Pow(0.5f, deltaTime / _RemoteRevsHalfLifeSeconds);
+
+            _remoteYawSmoothed = Mathf.Lerp(_remoteYawSmoothed, _remoteYawTarget, _risYawT);
+            _remoteThrottleSmoothed = Mathf.Lerp(_remoteThrottleSmoothed, _remoteThrottleTarget, _risThrottleT);
+            _remoteRevsSmoothed = Mathf.Lerp(_remoteRevsSmoothed, _remoteRevsTarget, _risRevsT);
+
+            // Overwrite the public synced fields locally so other scripts reading these variables
+            // (e.g. effects/animation) get the interpolated value on non-owners.
+            YawInput = _remoteYawSmoothed;
+            ThrottleInput = _remoteThrottleSmoothed;
+            Revs = _remoteRevsSmoothed;
+        }
+
+        public override void OnDeserialization()
+        {
+            // Capture stepwise network updates as targets, but keep the exposed values smooth.
+            if (Networking.IsOwner(gameObject)) { return; }
+
+            _remoteYawTarget = YawInput;
+            _remoteThrottleTarget = ThrottleInput;
+            _remoteRevsTarget = Revs;
+
+            if (!_remoteInputSmoothingInitialized)
+            {
+                _remoteYawSmoothed = _remoteYawTarget;
+                _remoteThrottleSmoothed = _remoteThrottleTarget;
+                _remoteRevsSmoothed = _remoteRevsTarget;
+                _remoteInputSmoothingInitialized = true;
+            }
+
+            YawInput = _remoteYawSmoothed;
+            ThrottleInput = _remoteThrottleSmoothed;
+            Revs = _remoteRevsSmoothed;
+        }
+
+        // Per-vehicle player proximity cache (avoid GetPlayers every frame).
+        // Note: wheels previously each ran their own GetPlayers() scan for skid-sync throttling.
+        // Centralizing this here avoids N_wheels * N_vehicles scans.
+        private const float _NearPlayerRadius = 100f;
+        private const float _NearPlayerRadiusSqr = _NearPlayerRadius * _NearPlayerRadius;
+        private const float _WheelNearPlayerRadius = 250f;
+        private const float _WheelNearPlayerRadiusSqr = _WheelNearPlayerRadius * _WheelNearPlayerRadius;
+        private const float _PlayerCacheRefreshSeconds = 0.5f;
+        [System.NonSerialized] private VRCPlayerApi[] _playerCache;
+        [System.NonSerialized] private float _nextPlayerCacheRefresh;
+        [System.NonSerialized] private bool _cachedAnyOtherPlayerNear;
+
+        // Public (non-synced) cache for wheels/effects to share.
+        [System.NonSerialized] public bool CachedAnyOtherPlayerNearWheels;
+
+        // UdonSharp CPU: cached temps for per-tick/proximity/sync helpers (avoid local declarations).
+        private float _risYawT;
+        private float _risThrottleT;
+        private float _risRevsT;
+
+        private float _pncNow;
+        private int _pncCount;
+        private bool _pncAnyNear;
+        private bool _pncAnyNearWheels;
+        private int _pncI;
+        private VRCPlayerApi _pncPlayer;
+        private Vector3 _pncDp;
+        private float _pncDpSqr;
+
+        private float _msInterval;
+        private Vector3 _msCenter;
+
+        private float _mrsNow;
+        private float _mrsInterval;
+
+        // UdonSharp GC-avoid: temps used inside _HasMeaningfulSyncChange()
+        [System.NonSerialized] private int _hmscBucket;
+
+        private void _UpdateAnyOtherPlayerNearCache(Vector3 center)
+        {
+            _pncNow = Time.time;
+            if (_pncNow < _nextPlayerCacheRefresh) { return; }
+            _nextPlayerCacheRefresh = _pncNow + _PlayerCacheRefreshSeconds;
+
+            _pncCount = VRCPlayerApi.GetPlayerCount();
+            if (_pncCount <= 0)
+            {
+                _cachedAnyOtherPlayerNear = false;
+                return;
+            }
+            if (_playerCache == null || _playerCache.Length != _pncCount)
+            {
+                _playerCache = new VRCPlayerApi[_pncCount];
+            }
+            _playerCache = VRCPlayerApi.GetPlayers(_playerCache);
+
+            _pncAnyNear = false;
+            _pncAnyNearWheels = false;
+            for (_pncI = 0; _pncI < _playerCache.Length; _pncI++)
+            {
+                _pncPlayer = _playerCache[_pncI];
+                if (!Utilities.IsValid(_pncPlayer)) { continue; }
+                // Owner tick / sync runs on the owner; ignore local player so "only owner nearby" throttles.
+                if (_pncPlayer.isLocal) { continue; }
+                _pncDp = _pncPlayer.GetPosition() - center;
+                _pncDpSqr = _pncDp.sqrMagnitude;
+
+                if (_pncDpSqr <= _WheelNearPlayerRadiusSqr)
+                {
+                    _pncAnyNearWheels = true;
+                }
+                if (_pncDpSqr <= _NearPlayerRadiusSqr)
+                {
+                    // Within the stricter radius implies within wheel radius too.
+                    _pncAnyNear = true;
+                    _pncAnyNearWheels = true;
+                    break;
+                }
+            }
+            _cachedAnyOtherPlayerNear = _pncAnyNear;
+            CachedAnyOtherPlayerNearWheels = _pncAnyNearWheels;
+        }
+
+        private void _MarkNetworkDirty()
+        {
+            _manualSyncDirty = true;
+        }
+
+        private float _GetManualSyncInterval()
+        {
+            if (Sleeping) { _msInterval = _ManualSyncSleepingInterval; }
+            else if (Piloting) { _msInterval = _ManualSyncPilotingInterval; }
+            else if (Occupied || Passenger) { _msInterval = _ManualSyncOccupiedInterval; }
+            else { _msInterval = _ManualSyncEmptyInterval; }
+
+            // If no other players are near this vehicle, cap to 1Hz.
+            _msCenter = VehicleTransform ? VehicleTransform.position : transform.position;
+            _UpdateAnyOtherPlayerNearCache(_msCenter);
+            if (!_cachedAnyOtherPlayerNear)
+            {
+                _msInterval = Mathf.Max(_msInterval, 1f);
+            }
+            return _msInterval;
+        }
+
+        private bool _HasMeaningfulSyncChange()
+        {
+            if (Mathf.Abs(Health - _lastSyncHealth) > _SyncEpsHealth) { return true; }
+
+            // Fuel changes constantly during driving; remote clients generally don't need per-frame accuracy.
+            // While piloting, sync Fuel only when it crosses coarse buckets (or hits empty).
+            if (Piloting)
+            {
+                if (Fuel <= 0f && _lastSyncFuel > 0f) { return true; }
+                _hmscBucket = (int)(Fuel / _FuelBucketSize);
+                if (_hmscBucket != _lastSyncFuelBucket) { return true; }
+            }
+            else
+            {
+                if (Mathf.Abs(Fuel - _lastSyncFuel) > _SyncEpsFuel) { return true; }
+            }
+
+            if (Mathf.Abs(Revs - _lastSyncRevs) > _SyncEpsRevs) { return true; }
+            if (Mathf.Abs(YawInput - _lastSyncYaw) > _SyncEpsYaw) { return true; }
+            if (Mathf.Abs(ThrottleInput - _lastSyncThrottle) > _SyncEpsThrottle) { return true; }
+            return false;
+        }
+
+        private void _CacheLastSyncedState()
+        {
+            _lastSyncHealth = Health;
+            _lastSyncFuel = Fuel;
+            _lastSyncFuelBucket = (int)(Fuel / _FuelBucketSize);
+            _lastSyncRevs = Revs;
+            _lastSyncYaw = YawInput;
+            _lastSyncThrottle = ThrottleInput;
+        }
+
+        private void _MaybeRequestSerialization()
+        {
+            if (!Networking.IsOwner(gameObject)) { return; }
+
+            _mrsNow = Time.time;
+            _mrsInterval = _GetManualSyncInterval();
+            if (!_manualSyncDirty && _mrsNow < _nextManualSyncTime) { return; }
+
+            if (!_manualSyncDirty)
+            {
+                if (!_HasMeaningfulSyncChange())
+                {
+                    _nextManualSyncTime = _mrsNow + _mrsInterval;
+                    return;
+                }
+            }
+            else
+            {
+                if (_mrsNow < _nextManualSyncTime && !_HasMeaningfulSyncChange())
+                {
+                    return;
+                }
+            }
+
+            RequestSerialization();
+            _CacheLastSyncedState();
+            _manualSyncDirty = false;
+            _nextManualSyncTime = _mrsNow + _mrsInterval;
+        }
+
+        private void _ForceRequestSerialization()
+        {
+            if (!Networking.IsOwner(gameObject)) { return; }
+            RequestSerialization();
+            _CacheLastSyncedState();
+            _manualSyncDirty = false;
+            _nextManualSyncTime = Time.time + _GetManualSyncInterval();
+        }
         private VRCPlayerApi localPlayer;
         [System.NonSerializedAttribute] public bool InEditor = true;
         [System.NonSerializedAttribute] public bool Initialized = false;
@@ -350,6 +656,14 @@ namespace SaccFlightAndVehicles
 
             IsOwner = EntityControl.IsOwner;
             UpdateWheelIsOwner();
+
+            if (!IsOwner)
+            {
+                _InitRemoteInputSmoothingFromCurrent();
+            }
+
+            _MarkNetworkDirty();
+            _nextManualSyncTime = 0f;
             InVR = EntityControl.InVR;
             localPlayer = Networking.LocalPlayer;
             if (localPlayer == null)
@@ -361,45 +675,65 @@ namespace SaccFlightAndVehicles
             EntityControl.Spawnrotation = VehicleTransform.localRotation;
             if (!ControlsRoot)
             { ControlsRoot = VehicleTransform; }
+
+            _CacheWheelsTyped();
             for (int i = 0; i < DriveWheels.Length; i++)
             {
-                DriveWheels[i].SetProgramVariable("IsDriveWheel", true);
+                var w = (i < _DriveWheelsCount) ? _DriveWheelsTyped[i] : null;
+                if (w != null) { w.IsDriveWheel = true; }
+                else if (DriveWheels[i] != null) { DriveWheels[i].SetProgramVariable("IsDriveWheel", true); }
             }
             for (int i = 0; i < SteerWheels.Length; i++)
             {
-                SteerWheels[i].SetProgramVariable("IsSteerWheel", true);
+                var w = (i < _SteerWheelsCount) ? _SteerWheelsTyped[i] : null;
+                if (w != null) { w.IsSteerWheel = true; }
+                else if (SteerWheels[i] != null) { SteerWheels[i].SetProgramVariable("IsSteerWheel", true); }
             }
             for (int i = 0; i < OtherWheels.Length; i++)
             {
-                OtherWheels[i].SetProgramVariable("IsOtherWheel", true);
+                var w = (i < _OtherWheelsCount) ? _OtherWheelsTyped[i] : null;
+                if (w != null) { w.IsOtherWheel = true; }
+                else if (OtherWheels[i] != null) { OtherWheels[i].SetProgramVariable("IsOtherWheel", true); }
             }
             if (TankMode)
             {
                 for (int i = 0; i < SteerWheels.Length; i++)
                 {
-                    SteerWheels[i].SetProgramVariable("IsDriveWheel", true);
+                    var w = (i < _SteerWheelsCount) ? _SteerWheelsTyped[i] : null;
+                    if (w != null) { w.IsDriveWheel = true; }
+                    else if (SteerWheels[i] != null) { SteerWheels[i].SetProgramVariable("IsDriveWheel", true); }
                 }
             }
             // Create AllWheels array, making sure that any wheel that is in drivewheels and steerwheels isn't there twice
             // We assume that no one is stupid enough to put a drive or steer wheel in otherwheels at the same time as it's pointless.
-            int uniqueDriveWheels = DriveWheels.Length;
-            bool[] wheelisDup = new bool[DriveWheels.Length];
-            for (int i = 0; i < DriveWheels.Length; i++)
+            int driveLen = DriveWheels.Length;
+            int steerLen = SteerWheels.Length;
+            int otherLen = OtherWheels.Length;
+
+            if (_WheelIsDupBuffer == null || _WheelIsDupBuffer.Length < driveLen)
             {
-                for (int o = 0; o < SteerWheels.Length; o++)
+                _WheelIsDupBuffer = new bool[driveLen];
+            }
+            for (int i = 0; i < driveLen; i++) { _WheelIsDupBuffer[i] = false; }
+
+            int uniqueDriveWheels = driveLen;
+            for (int i = 0; i < driveLen; i++)
+            {
+                for (int o = 0; o < steerLen; o++)
                 {
                     if (DriveWheels[i] == SteerWheels[o])
                     {
-                        wheelisDup[i] = true;
+                        _WheelIsDupBuffer[i] = true;
                         uniqueDriveWheels--;
+                        break;
                     }
                 }
             }
-            AllWheels = new SaccWheel[uniqueDriveWheels + SteerWheels.Length + OtherWheels.Length];
+            AllWheels = new SaccWheel[uniqueDriveWheels + steerLen + otherLen];
             int sub = 0;
-            for (int i = 0; i < DriveWheels.Length; i++)
+            for (int i = 0; i < driveLen; i++)
             {
-                if (wheelisDup[i])
+                if (_WheelIsDupBuffer[i])
                 {
                     sub++;
                 }
@@ -409,20 +743,62 @@ namespace SaccFlightAndVehicles
                 }
             }
             int insertIndex = uniqueDriveWheels;
-            for (int i = 0; i < SteerWheels.Length; i++)
+            for (int i = 0; i < steerLen; i++)
             {
                 AllWheels[insertIndex++] = SteerWheels[i];
             }
-            for (int i = 0; i < OtherWheels.Length; i++)
+            for (int i = 0; i < otherLen; i++)
             {
                 AllWheels[insertIndex++] = OtherWheels[i];
             }
 
             CurrentlyDistant = true;
+            // Start the distance loop. (CheckDistance() now early-returns unless this flag is true.)
+            _checkDistanceLoopActive = true;
             SendCustomEventDelayedSeconds(nameof(CheckDistance), Random.Range(5f, 7f));//dont do all vehicles on same frame
             revUpDT = 1f / NumStepsSec;
 
             SetupGCalcValues();
+        }
+
+        private void _CacheWheelsTyped()
+        {
+            _DriveWheelsCount = 0;
+            _SteerWheelsCount = 0;
+            _OtherWheelsCount = 0;
+
+            if (DriveWheels != null) { _DriveWheelsCount = DriveWheels.Length; }
+            if (SteerWheels != null) { _SteerWheelsCount = SteerWheels.Length; }
+            if (OtherWheels != null) { _OtherWheelsCount = OtherWheels.Length; }
+
+            if (_DriveWheelsTyped == null || _DriveWheelsTyped.Length != _DriveWheelsCount)
+            { _DriveWheelsTyped = new SaccWheel[_DriveWheelsCount]; }
+            if (_SteerWheelsTyped == null || _SteerWheelsTyped.Length != _SteerWheelsCount)
+            { _SteerWheelsTyped = new SaccWheel[_SteerWheelsCount]; }
+            if (_OtherWheelsTyped == null || _OtherWheelsTyped.Length != _OtherWheelsCount)
+            { _OtherWheelsTyped = new SaccWheel[_OtherWheelsCount]; }
+
+            for (int i = 0; i < _DriveWheelsCount; i++)
+            {
+                SaccWheel w = null;
+                UdonSharpBehaviour b = DriveWheels[i];
+                if (b != null) { w = b.GetComponent<SaccWheel>(); }
+                _DriveWheelsTyped[i] = w;
+            }
+            for (int i = 0; i < _SteerWheelsCount; i++)
+            {
+                SaccWheel w = null;
+                UdonSharpBehaviour b = SteerWheels[i];
+                if (b != null) { w = b.GetComponent<SaccWheel>(); }
+                _SteerWheelsTyped[i] = w;
+            }
+            for (int i = 0; i < _OtherWheelsCount; i++)
+            {
+                SaccWheel w = null;
+                UdonSharpBehaviour b = OtherWheels[i];
+                if (b != null) { w = b.GetComponent<SaccWheel>(); }
+                _OtherWheelsTyped[i] = w;
+            }
         }
         public void SetupGCalcValues()
         {
@@ -442,10 +818,23 @@ namespace SaccFlightAndVehicles
         }
         public void SetCoMMeshOffset()
         {
+            // IMPORTANT: This must be idempotent. If the object is enabled/disabled rapidly,
+            // SetCoM_ITR may not have executed yet (it's delayed), and calling this multiple
+            // times would keep shifting the mesh further each time.
+            if (_CoMMeshOffsetApplied)
+            {
+                if (!SetCoM_ITR_initialized && EntityControl.gameObject.activeInHierarchy)
+                {
+                    _ScheduleSetCoM_ITR();
+                }
+                return;
+            }
+            _CoMMeshOffsetApplied = true;
+
             //move objects to so that the vehicle's main pivot is at the CoM so that syncscript's rotation is smoother
             Vector3 CoMOffset = CenterOfMass.position - VehicleTransform.position;
+            _CoMMeshOffsetLastApplied = CoMOffset;
             int c = VehicleTransform.childCount;
-            Transform[] MainObjChildren = new Transform[c];
             for (int i = 0; i < c; i++)
             {
                 VehicleTransform.GetChild(i).position -= CoMOffset;
@@ -456,15 +845,277 @@ namespace SaccFlightAndVehicles
             EntityControl.Spawnrotation = VehicleTransform.localRotation;
             // inertia tensor wont be set properly if object is disabled
             if (SetCoM_ITR_initialized || !EntityControl.gameObject.activeInHierarchy) return;
-            SendCustomEventDelayedSeconds(nameof(SetCoM_ITR), Time.fixedDeltaTime);//this has to be delayed because ?
+            _ScheduleSetCoM_ITR();//this has to be delayed because ?
         }
         public void SFEXT_L_OnEnable()
         {
+            // Track the first enable time so we can detect the "startup disable" pattern:
+            // level root starts active -> Game.Start disables all roots -> later re-enable.
+            if (!_sawFirstEnable)
+            {
+                _sawFirstEnable = true;
+                _firstEnableTime = Time.time;
+            }
+
+            // If this vehicle was active at world load and later disabled by game state,
+            // re-enabling can leave PhysX/contact caches in a bad state. Do a short reinit
+            // (freeze RB for 1 frame, sync pose, then resume) to prevent "forced into ground" spazz.
+            if (_needsPhysicsReinitOnNextEnable)
+            {
+                _BeginPhysicsReinit();
+                _needsPhysicsReinitOnNextEnable = false;
+            }
+
             if (!SetCoM_ITR_initialized)
                 if (Initialized) // don't set ITR if not initialized because the call in SetCoMMeshOffset() will do it
                     SetCoMMeshOffset();
+
+            // Level roots are sometimes toggled off/on quickly; ensure we don't carry stale drive inputs.
+            Piloting = false;
+            Passenger = false;
+            Occupied = false;
+            TANK_Cruising = false;
+            System.Array.Clear(TankThrottles, 0, 2);
+            ThrottleInput = 0f;
+            YawInput = 0f;
+            PlayerThrottle = 0f;
+            Revs = 0f;
+            EngineForceUsed = 0f;
+
+            Sleeping = false;
+            if (VehicleRigidbody != null)
+            {
+                VehicleRigidbody.useGravity = true;
+                VehicleRigidbody.WakeUp();
+                if (!VehicleRigidbody.isKinematic)
+                {
+                    VehicleRigidbody.velocity = Vector3.zero;
+                    VehicleRigidbody.angularVelocity = Vector3.zero;
+                }
+            }
+
+            // If we were disabled (e.g., level root toggle), wheels may have been put to sleep via FallAsleep().
+            // Wake them here so suspension, skid, and other per-wheel logic resumes immediately.
+            if (AllWheels != null)
+            {
+                for (int i = 0; i < AllWheels.Length; i++)
+                {
+                    if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("WakeUp"); }
+                }
+            }
+            CurrentVel = Vector3.zero;
+            LastFrameVel = Vector3.zero;
+            LastTouchedTransform_Speed = Vector3.zero;
+
+            // Restart the distance loop exactly once after a disable/enable.
+            if (!_checkDistanceLoopActive)
+            {
+                _checkDistanceLoopActive = true;
+                SendCustomEventDelayedSeconds(nameof(CheckDistance), 0.25f);
+            }
         }
+
+        public void SFEXT_L_OnDisable()
+        {
+            // Stop any self-rescheduling loops from multiplying after rapid enable/disable.
+            _checkDistanceLoopActive = false;
+
+            // Invalidate any pending delayed CoM/ITR application from the previous enable.
+            _setCoMITR_Generation++;
+            _setCoMITR_Pending = false;
+
+            // If we were enabled at world load and get disabled very soon after, this is almost
+            // certainly the Game.Start "disable all level roots" pass. In that case, undo any
+            // CoM mesh offset that already ran so that the next enable applies it cleanly.
+            if (_sawFirstEnable && !_startupDisableHandled && (Time.time - _firstEnableTime) < 3f)
+            {
+                _startupDisableHandled = true;
+                _UndoCoMMeshOffsetForStartupDisable();
+            }
+
+            // Mark for a physics reinit next time we enable. This specifically targets:
+            // "level was active on load -> game disables all level roots -> later re-enable".
+            if (Initialized)
+            {
+                _needsPhysicsReinitOnNextEnable = true;
+            }
+
+            // Hard reset drive inputs so a disabled vehicle can't come back with high revs/throttle and burn out in place.
+            Piloting = false;
+            Passenger = false;
+            Occupied = false;
+            TANK_Cruising = false;
+            System.Array.Clear(TankThrottles, 0, 2);
+            ThrottleInput = 0f;
+            YawInput = 0f;
+            PlayerThrottle = 0f;
+            Revs = 0f;
+            EngineForceUsed = 0f;
+
+            Sleeping = true;
+            if (AllWheels != null)
+            {   
+                for (int i = 0; i < AllWheels.Length; i++)
+                {
+                    if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("FallAsleep"); }
+                }
+            }
+        }
+        [System.NonSerialized] private bool _needsPhysicsReinitOnNextEnable;
+        [System.NonSerialized] private bool _physicsReinitInProgress;
+        [System.NonSerialized] private bool _rbReinitWasKinematic;
+        [System.NonSerialized] private bool _rbReinitHadCollisions;
+        [System.NonSerialized] private int _physicsReinitDelayFrames = 3;
+        [System.NonSerialized] private bool _physicsReinitWasForOwnership;
+        [System.NonSerialized] private float _physicsReinitStartTime;
+
+        private void _BeginPhysicsReinit()
+        {
+            if (_physicsReinitInProgress) { return; }
+            if (VehicleRigidbody == null || VehicleTransform == null) { return; }
+            _physicsReinitInProgress = true;
+            _physicsReinitStartTime = Time.time;
+
+            _rbReinitWasKinematic = VehicleRigidbody.isKinematic;
+            _rbReinitHadCollisions = VehicleRigidbody.detectCollisions;
+
+            if (!VehicleRigidbody.isKinematic)
+            {
+                VehicleRigidbody.velocity = Vector3.zero;
+                VehicleRigidbody.angularVelocity = Vector3.zero;
+            }
+            else
+            {
+                VehicleRigidbody.Sleep();
+            }
+
+            // Temporarily disable simulation so the first physics step after enable can't explode.
+            VehicleRigidbody.isKinematic = true;
+            VehicleRigidbody.detectCollisions = false;
+
+            // Force pose sync (Unity 2022 RB pose can desync across enable/disable).
+            VehicleRigidbody.position = VehicleTransform.position;
+            VehicleRigidbody.rotation = VehicleTransform.rotation;
+            Physics.SyncTransforms();
+
+            // Clear wheel contact history so we don't compute huge point velocities on first contact.
+            _ResetAllWheelsAfterTeleport();
+
+            int delayFrames = _physicsReinitDelayFrames;
+            if (delayFrames < 1) { delayFrames = 1; }
+            SendCustomEventDelayedFrames(nameof(_FinishPhysicsReinit), delayFrames);
+        }
+
+        public void _FinishPhysicsReinit()
+        {
+            if (VehicleRigidbody == null || VehicleTransform == null)
+            {
+                _physicsReinitInProgress = false;
+                _physicsReinitWasForOwnership = false;
+                return;
+            }
+
+            VehicleRigidbody.position = VehicleTransform.position;
+            VehicleRigidbody.rotation = VehicleTransform.rotation;
+            Physics.SyncTransforms();
+
+            VehicleRigidbody.detectCollisions = _rbReinitHadCollisions;
+            VehicleRigidbody.isKinematic = _rbReinitWasKinematic;
+
+            // For manual-sync vehicles, the owner must be simulating physics.
+            // If we ever captured/restored a kinematic state (or finish runs late), force it back.
+            if (_physicsReinitWasForOwnership && UsingManualSync)
+            {
+                VehicleRigidbody.detectCollisions = true;
+                VehicleRigidbody.isKinematic = false;
+                VehicleRigidbody.useGravity = true;
+            }
+
+            VehicleRigidbody.WakeUp();
+
+            if (_physicsReinitWasForOwnership)
+            {
+                // One more wheel reset after the RB is live again to avoid any single-frame stale contacts.
+                _ResetAllWheelsAfterTeleport();
+
+                if (!VehicleRigidbody.isKinematic)
+                {
+                    Vector3 v = VehicleRigidbody.velocity;
+                    Vector3 av = VehicleRigidbody.angularVelocity;
+                    if (v.sqrMagnitude < 0.01f && av.sqrMagnitude < 0.01f)
+                    {
+                        VehicleRigidbody.velocity = Vector3.zero;
+                        VehicleRigidbody.angularVelocity = Vector3.zero;
+                    }
+                    CurrentVel = VehicleRigidbody.velocity;
+                    LastFrameVel = CurrentVel;
+                }
+                VehiclePosLastFrame = VehicleTransform.position;
+                _physicsReinitWasForOwnership = false;
+            }
+            _physicsReinitInProgress = false;
+        }
+        [System.NonSerialized] private bool _CoMMeshOffsetApplied;
+        [System.NonSerialized] private Vector3 _CoMMeshOffsetLastApplied;
         bool SetCoM_ITR_initialized;
+        [System.NonSerialized] private bool _checkDistanceLoopActive;
+
+        [System.NonSerialized] private bool _sawFirstEnable;
+        [System.NonSerialized] private float _firstEnableTime;
+        [System.NonSerialized] private bool _startupDisableHandled;
+
+        private void _UndoCoMMeshOffsetForStartupDisable()
+        {
+            if (!_CoMMeshOffsetApplied) { return; }
+            if (VehicleTransform == null || VehicleRigidbody == null) { return; }
+
+            Vector3 off = _CoMMeshOffsetLastApplied;
+            if (off == Vector3.zero) { return; }
+
+            int c = VehicleTransform.childCount;
+            for (int i = 0; i < c; i++)
+            {
+                VehicleTransform.GetChild(i).position += off;
+            }
+            VehicleTransform.position -= off;
+            VehicleRigidbody.position = VehicleTransform.position;
+
+            // Allow re-application on the next enable (behave like scenario where root started disabled).
+            _CoMMeshOffsetApplied = false;
+            SetCoM_ITR_initialized = false;
+            if (EntityControl != null) { EntityControl.CoMSet = false; }
+
+            // Reset RB mass properties; SetCoM_ITR will set them properly after the next enable.
+            VehicleRigidbody.ResetCenterOfMass();
+            VehicleRigidbody.ResetInertiaTensor();
+
+            // Any already-scheduled SetCoM_ITR call from before the disable is now stale.
+            _setCoMITR_Generation++;
+            _setCoMITR_Pending = false;
+        }
+
+        [System.NonSerialized] private int _setCoMITR_Generation;
+        [System.NonSerialized] private int _setCoMITR_ScheduledGeneration;
+        [System.NonSerialized] private bool _setCoMITR_Pending;
+
+        private void _ScheduleSetCoM_ITR()
+        {
+            if (SetCoM_ITR_initialized) { return; }
+            if (EntityControl == null || !EntityControl.gameObject.activeInHierarchy) { return; }
+            if (_setCoMITR_Pending) { return; }
+            _setCoMITR_Pending = true;
+            _setCoMITR_ScheduledGeneration = _setCoMITR_Generation;
+            SendCustomEventDelayedSeconds(nameof(_RunSetCoM_ITR_Delayed), Time.fixedDeltaTime);
+        }
+
+        public void _RunSetCoM_ITR_Delayed()
+        {
+            _setCoMITR_Pending = false;
+            if (_setCoMITR_ScheduledGeneration != _setCoMITR_Generation) { return; }
+            if (EntityControl == null || !EntityControl.gameObject.activeInHierarchy) { return; }
+            if (SetCoM_ITR_initialized) { return; }
+            SetCoM_ITR();
+        }
         public void SetCoM_ITR()
         {
             SetCoM_ITR_initialized = true;
@@ -514,11 +1165,23 @@ namespace SaccFlightAndVehicles
             //VR Throttle
             if (ThrottleGrip > GripSensitivity)
             {
+                VRCPlayerApi lp = localPlayer;
+                if (!Utilities.IsValid(lp) || lp.isSuspended)
+                {
+                    lp = Networking.LocalPlayer;
+                    if (!Utilities.IsValid(lp) || lp.isSuspended)
+                    {
+                        // Cannot read tracking data right now (common during join/suspend). Keep last value.
+                        return TankThrottles[SliderIndex];
+                    }
+                    localPlayer = lp;
+                }
+
                 Vector3 handdistance;
                 if (LeftHand)
-                { handdistance = ControlsRoot.position - localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.LeftHand).position; }
+                { handdistance = ControlsRoot.position - lp.GetTrackingData(VRCPlayerApi.TrackingDataType.LeftHand).position; }
                 else
-                { handdistance = ControlsRoot.position - localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.RightHand).position; }
+                { handdistance = ControlsRoot.position - lp.GetTrackingData(VRCPlayerApi.TrackingDataType.RightHand).position; }
                 handdistance = ControlsRoot.InverseTransformDirection(handdistance);
 
                 float HandThrottleAxis = handdistance.z;
@@ -527,12 +1190,12 @@ namespace SaccFlightAndVehicles
                 {
                     if (LeftHand)
                     {
-                        localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, .05f, .222f, 35);
+                        lp.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, .05f, .222f, 35);
                         EntityControl.SendEventToExtensions("SFEXT_O_ThrottleGrabbed_L");
                     }
                     else
                     {
-                        localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, .05f, .222f, 35);
+                        lp.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, .05f, .222f, 35);
                         EntityControl.SendEventToExtensions("SFEXT_O_ThrottleGrabbed_R");
                     }
                     ThrottleZeroPoint[SliderIndex] = HandThrottleAxis;
@@ -557,12 +1220,14 @@ namespace SaccFlightAndVehicles
                     }
                     if (LeftHand)
                     {
-                        localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, .05f, .222f, 35);
+                        if (Utilities.IsValid(localPlayer) && !localPlayer.isSuspended)
+                        { localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Left, .05f, .222f, 35); }
                         EntityControl.SendEventToExtensions("SFEXT_O_ThrottleDropped_L");
                     }
                     else
                     {
-                        localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, .05f, .222f, 35);
+                        if (Utilities.IsValid(localPlayer) && !localPlayer.isSuspended)
+                        { localPlayer.PlayHapticEventInHand(VRC_Pickup.PickupHand.Right, .05f, .222f, 35); }
                         EntityControl.SendEventToExtensions("SFEXT_O_ThrottleDropped_R");
                     }
                     ThrottleGripLastFrame[SliderIndex] = false;
@@ -573,7 +1238,45 @@ namespace SaccFlightAndVehicles
         }
         private void LateUpdate()
         {
-            float DeltaTime = Time.deltaTime;
+            _luTickNow = Time.time;
+
+            // Safety: if a delayed-frame finish never runs (rare timing/enable edge cases),
+            // the rigidbody can remain kinematic/collisionless and appear "frozen".
+            if (_physicsReinitInProgress && (_luTickNow - _physicsReinitStartTime) > 1.0f)
+            {
+                _FinishPhysicsReinit();
+            }
+
+            if (IsOwner)
+            {
+                if (!_lateUpdateWasOwner)
+                {
+                    _nextOwnerLateUpdateTime = 0f;
+                    _lastOwnerLateUpdateTime = 0f;
+                }
+                if (_luTickNow < _nextOwnerLateUpdateTime) { return; }
+                _luDeltaTime = (_lastOwnerLateUpdateTime > 0f) ? (_luTickNow - _lastOwnerLateUpdateTime) : Time.deltaTime;
+                _lastOwnerLateUpdateTime = _luTickNow;
+                _nextOwnerLateUpdateTime = _luTickNow + _OwnerLateUpdateInterval;
+            }
+            else
+            {
+                if (_lateUpdateWasOwner)
+                {
+                    _nextNonOwnerLateUpdateTime = 0f;
+                    _lastNonOwnerLateUpdateTime = 0f;
+                }
+                if (_luTickNow < _nextNonOwnerLateUpdateTime) { return; }
+                _luDeltaTime = (_lastNonOwnerLateUpdateTime > 0f) ? (_luTickNow - _lastNonOwnerLateUpdateTime) : Time.deltaTime;
+                _lastNonOwnerLateUpdateTime = _luTickNow;
+                _nextNonOwnerLateUpdateTime = _luTickNow + _NonOwnerLateUpdateInterval;
+            }
+            _lateUpdateWasOwner = IsOwner;
+
+            if (!IsOwner)
+            {
+                _UpdateRemoteInputSmoothing(_luDeltaTime);
+            }
             if (IsOwner)
             {
                 if (!EntityControl._dead)
@@ -590,26 +1293,47 @@ namespace SaccFlightAndVehicles
                     VehicleSpeed = CurrentVel.magnitude;
                     NumGroundedWheels = 0;
                     NumGroundedSteerWheels = 0;
-                    for (int i = 0; i < SteerWheels.Length; i++)
+
+                    _luSteerLen = SteerWheels.Length;
+                    _luDriveLen = DriveWheels.Length;
+                    _luOtherLen = OtherWheels.Length;
+
+                    for (_luI = 0; _luI < _luSteerLen; _luI++)
                     {
-                        if ((bool)SteerWheels[i].GetProgramVariable("Grounded"))
+                        _luWheel = (_luI < _SteerWheelsCount) ? _SteerWheelsTyped[_luI] : null;
+                        if (_luWheel != null)
                         {
-                            NumGroundedSteerWheels++;
+                            if (_luWheel.Grounded) { NumGroundedSteerWheels++; }
+                        }
+                        else if (SteerWheels[_luI] != null)
+                        {
+                            if ((bool)SteerWheels[_luI].GetProgramVariable("Grounded")) { NumGroundedSteerWheels++; }
                         }
                     }
+
                     NumGroundedWheels = NumGroundedSteerWheels;
-                    for (int i = 0; i < DriveWheels.Length; i++)
+                    for (_luI = 0; _luI < _luDriveLen; _luI++)
                     {
-                        if ((bool)DriveWheels[i].GetProgramVariable("Grounded"))
+                        _luWheel = (_luI < _DriveWheelsCount) ? _DriveWheelsTyped[_luI] : null;
+                        if (_luWheel != null)
                         {
-                            NumGroundedWheels++;
+                            if (_luWheel.Grounded) { NumGroundedWheels++; }
+                        }
+                        else if (DriveWheels[_luI] != null)
+                        {
+                            if ((bool)DriveWheels[_luI].GetProgramVariable("Grounded")) { NumGroundedWheels++; }
                         }
                     }
-                    for (int i = 0; i < OtherWheels.Length; i++)
+                    for (_luI = 0; _luI < _luOtherLen; _luI++)
                     {
-                        if ((bool)OtherWheels[i].GetProgramVariable("Grounded"))
+                        _luWheel = (_luI < _OtherWheelsCount) ? _OtherWheelsTyped[_luI] : null;
+                        if (_luWheel != null)
                         {
-                            NumGroundedWheels++;
+                            if (_luWheel.Grounded) { NumGroundedWheels++; }
+                        }
+                        else if (OtherWheels[_luI] != null)
+                        {
+                            if ((bool)OtherWheels[_luI].GetProgramVariable("Grounded")) { NumGroundedWheels++; }
                         }
                     }
                     //send grounded events
@@ -695,26 +1419,25 @@ namespace SaccFlightAndVehicles
                             }
                             if (TANK_StickMode)
                             {
-                                Vector2 LStickPos;
-                                LStickPos.x = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryThumbstickHorizontal");
-                                LStickPos.y = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryThumbstickVertical");
-                                float stickangle = Vector2.SignedAngle(Vector2.up, LStickPos);
-                                float forwardamount = LStickPos.y;
-                                if (stickangle < 95 && stickangle > -95)
+                                _luStickPos.x = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryThumbstickHorizontal");
+                                _luStickPos.y = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryThumbstickVertical");
+                                _luStickAngle = Vector2.SignedAngle(Vector2.up, _luStickPos);
+                                _luForwardAmount = _luStickPos.y;
+                                if (_luStickAngle < 95 && _luStickAngle > -95)
                                 {
                                     //going forward
-                                    stickangle = (stickangle / 90) * LStickPos.magnitude * TANK_StickMode_SteeringSens;
-                                    forwardamount = Mathf.Max(forwardamount, 0);
+                                    _luStickAngle = (_luStickAngle / 90) * _luStickPos.magnitude * TANK_StickMode_SteeringSens;
+                                    _luForwardAmount = Mathf.Max(_luForwardAmount, 0);
                                 }
                                 else
                                 {
                                     //going backward
-                                    stickangle = ((180 * Mathf.Sign(stickangle)) - stickangle);// flip 180 for backwards
-                                    stickangle = (-stickangle / 85) * LStickPos.magnitude * TANK_StickMode_SteeringSens;
-                                    forwardamount = Mathf.Min(forwardamount, 0);
+                                    _luStickAngle = ((180 * Mathf.Sign(_luStickAngle)) - _luStickAngle);// flip 180 for backwards
+                                    _luStickAngle = (-_luStickAngle / 85) * _luStickPos.magnitude * TANK_StickMode_SteeringSens;
+                                    _luForwardAmount = Mathf.Min(_luForwardAmount, 0);
                                 }
-                                LeftThrottle = Mathf.Clamp(LeftTrackF + LeftTrackB + -stickangle + forwardamount, -1, 1);
-                                RightThrottle = Mathf.Clamp(RightTrackF + RightTrackB + stickangle + forwardamount, -1, 1);
+                                LeftThrottle = Mathf.Clamp(LeftTrackF + LeftTrackB + -_luStickAngle + _luForwardAmount, -1, 1);
+                                RightThrottle = Mathf.Clamp(RightTrackF + RightTrackB + _luStickAngle + _luForwardAmount, -1, 1);
                             }
                             else
                             {
@@ -741,86 +1464,111 @@ namespace SaccFlightAndVehicles
                             // bool RightNeg = RightThrottle < 0;
                             // float RGearRatio = RightNeg ? -GearRatio : GearRatio;
                             // float LGearRatio = LeftNeg ? -GearRatio : GearRatio;
-                            float reverseSpeedL = LeftThrottle < 0 ? TANK_ReverseSpeed : 1;
-                            float reverseSpeedR = RightThrottle < 0 ? TANK_ReverseSpeed : 1;
-                            float LGearRatio = Mathf.LerpUnclamped(0, GearRatio, LeftThrottle * reverseSpeedL);
-                            float RGearRatio = Mathf.LerpUnclamped(0, GearRatio, RightThrottle * reverseSpeedR);
+                            _luReverseSpeedL = LeftThrottle < 0 ? TANK_ReverseSpeed : 1;
+                            _luReverseSpeedR = RightThrottle < 0 ? TANK_ReverseSpeed : 1;
+                            _luLGearRatio = Mathf.LerpUnclamped(0, GearRatio, LeftThrottle * _luReverseSpeedL);
+                            _luRGearRatio = Mathf.LerpUnclamped(0, GearRatio, RightThrottle * _luReverseSpeedR);
 
                             // float LClutch = Clutch;
                             // float RClutch = Clutch;
                             // if (LeftThrottle == 0) { LClutch = 1; }
                             // if (RightThrottle == 0) { RClutch = 1; }
-                            for (int i = 0; i < DriveWheels.Length; i++)
+                            for (_luI = 0; _luI < DriveWheels.Length; _luI++)
                             {
-                                DriveWheels[i].SetProgramVariable("Clutch", Clutch);
-                                DriveWheels[i].SetProgramVariable("_GearRatio", LGearRatio);
+                                _luWheel = (_luI < _DriveWheelsCount) ? _DriveWheelsTyped[_luI] : null;
+                                if (_luWheel != null)
+                                {
+                                    _luWheel.Clutch = Clutch;
+                                    _luWheel.GearRatio = _luLGearRatio;
+                                }
+                                else if (DriveWheels[_luI] != null)
+                                {
+                                    DriveWheels[_luI].SetProgramVariable("Clutch", Clutch);
+                                    DriveWheels[_luI].SetProgramVariable("_GearRatio", _luLGearRatio);
+                                }
                             }
-                            for (int i = 0; i < SteerWheels.Length; i++)
+                            for (_luI = 0; _luI < SteerWheels.Length; _luI++)
                             {
-                                SteerWheels[i].SetProgramVariable("Clutch", Clutch);
-                                SteerWheels[i].SetProgramVariable("_GearRatio", RGearRatio);
+                                _luWheel = (_luI < _SteerWheelsCount) ? _SteerWheelsTyped[_luI] : null;
+                                if (_luWheel != null)
+                                {
+                                    _luWheel.Clutch = Clutch;
+                                    _luWheel.GearRatio = _luRGearRatio;
+                                }
+                                else if (SteerWheels[_luI] != null)
+                                {
+                                    SteerWheels[_luI].SetProgramVariable("Clutch", Clutch);
+                                    SteerWheels[_luI].SetProgramVariable("_GearRatio", _luRGearRatio);
+                                }
                             }
                         }
                     }
                     else
                     {
-                        int Wi = 0;
-                        int Ai = 0;
-                        int Di = 0;
-                        float LGrip = 0;
-                        float RGrip = 0;
+                        _luWi = 0;
+                        _luAi = 0;
+                        _luDi = 0;
+                        _luLGrip = 0;
+                        _luRGrip = 0;
                         //inputs as ints
 
 #if UNITY_EDITOR
-                        Wi = Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow) || ACCELTEST ? 1 : 0;
+                        _luWi = Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow) || ACCELTEST ? 1 : 0;
 #else
-                            Wi = Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow) ? 1 : 0;
+                            _luWi = Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.UpArrow) ? 1 : 0;
 #endif
                         //int Si = Input.GetKey(KeyCode.S) ? -1 : 0;
-                        Ai = Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow) ? -1 : 0;
-                        Di = Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow) ? 1 : 0;
+                        _luAi = Input.GetKey(KeyCode.A) || Input.GetKey(KeyCode.LeftArrow) ? -1 : 0;
+                        _luDi = Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.RightArrow) ? 1 : 0;
                         if (!InEditor)
                         {
-                            LGrip = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryHandTrigger");
-                            RGrip = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryHandTrigger");
+                            _luLGrip = Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryHandTrigger");
+                            _luRGrip = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryHandTrigger");
                         }
                         //float ThrottleGrip;
                         // if (SwitchHandsJoyThrottle)
                         // { ThrottleGrip = RGrip; }
                         // else
-                        // { ThrottleGrip = LGrip; }
-                        if (EnableLeaning)
-                        {
-                            int Threei = Input.GetKey(KeyCode.Alpha3) ? -1 : 0;
-                            int Ri = Input.GetKey(KeyCode.R) ? 1 : 0;
-                            float VRLean = 0;
-                            float VRLeanPitch = 0;
-                            if (InVR)
-                            {
-                                Vector3 HeadLean = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).rotation * Vector3.up;
-                                Vector3 HeadLeanRoll = Vector3.ProjectOnPlane(HeadLean, ControlsRoot.forward);
-                                VRLean = Vector3.SignedAngle(HeadLeanRoll, ControlsRoot.up, ControlsRoot.forward);
-                                VRLean = Mathf.Clamp(VRLean / LeanSensitivity_Roll, -1, 1);
+                        // // { ThrottleGrip = LGrip; }
+                        // if (EnableLeaning)
+                        // {
+                        //     _luThreei = Input.GetKey(KeyCode.Alpha3) ? -1 : 0;
+                        //     _luRi = Input.GetKey(KeyCode.R) ? 1 : 0;
+                        //     _luVRLean = 0;
+                        //     _luVRLeanPitch = 0;
+                        //     _luLp = localPlayer;
+                        //     if (!Utilities.IsValid(_luLp) || _luLp.isSuspended)
+                        //     {
+                        //         _luLp = Networking.LocalPlayer;
+                        //         if (Utilities.IsValid(_luLp) && !_luLp.isSuspended) { localPlayer = _luLp; }
+                        //         else { _luLp = null; }
+                        //     }
+                        //     if (_luLp != null)
+                        //     {
+                        //         if (InVR)
+                        //         {
+                        //             _luHeadLean = _luLp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).rotation * Vector3.up;
+                        //             _luHeadLeanRoll = Vector3.ProjectOnPlane(_luHeadLean, ControlsRoot.forward);
+                        //             _luVRLean = Vector3.SignedAngle(_luHeadLeanRoll, ControlsRoot.up, ControlsRoot.forward);
+                        //             _luVRLean = Mathf.Clamp(_luVRLean / LeanSensitivity_Roll, -1, 1);
 
-                                Vector3 HeadOffset = ControlsRoot.position - localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).position;
-                                HeadOffset = ControlsRoot.InverseTransformDirection(HeadOffset);
-                                /*                Vector3 HeadLeanPitch = Vector3.ProjectOnPlane(HeadLean, ControlsRoot.right);
-                                               VRLeanPitch = Vector3.SignedAngle(HeadLeanPitch, ControlsRoot.up, ControlsRoot.right);
-                                               VRLeanPitch = Mathf.Clamp(VRLeanPitch / 25f, -1, 1); */
-                                VRLeanPitch = Mathf.Clamp(HeadOffset.z * LeanSensitivity_Pitch, -1, 1);
-                            }
-                            else
-                            {
-                                Vector3 HeadLean = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).rotation * Vector3.forward;
-                                Vector3 HeadLeanRoll = Vector3.ProjectOnPlane(HeadLean, ControlsRoot.up);
-                                VRLean = Vector3.SignedAngle(HeadLeanRoll, ControlsRoot.forward, ControlsRoot.up);
-                                VRLean = -Mathf.Clamp(VRLean / 25f, -1, 1);
-                            }
+                        //             _luHeadOffset = ControlsRoot.position - _luLp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).position;
+                        //             _luHeadOffset = ControlsRoot.InverseTransformDirection(_luHeadOffset);
+                        //             _luVRLeanPitch = Mathf.Clamp(_luHeadOffset.z * LeanSensitivity_Pitch, -1, 1);
+                        //         }
+                        //         else
+                        //         {
+                        //             _luHeadLean = _luLp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).rotation * Vector3.forward;
+                        //             _luHeadLeanRoll = Vector3.ProjectOnPlane(_luHeadLean, ControlsRoot.up);
+                        //             _luVRLean = Vector3.SignedAngle(_luHeadLeanRoll, ControlsRoot.forward, ControlsRoot.up);
+                        //             _luVRLean = -Mathf.Clamp(_luVRLean / 25f, -1, 1);
+                        //         }
+                        //     }
 
-                            VehicleAnimator.SetFloat("lean", (VRLean * .5f) + .5f);
-                            VehicleAnimator.SetFloat("leanpitch", (VRLeanPitch * .5f) + .5f);
-                            VehicleRigidbody.centerOfMass = transform.InverseTransformDirection(CenterOfMass.position - transform.position);//correct position if scaled}
-                        }
+                        //     VehicleAnimator.SetFloat("lean", (_luVRLean * .5f) + .5f);
+                        //     VehicleAnimator.SetFloat("leanpitch", (_luVRLeanPitch * .5f) + .5f);
+                        //     VehicleRigidbody.centerOfMass = transform.InverseTransformDirection(CenterOfMass.position - transform.position);//correct position if scaled}
+                        // }
 
                         ///VR Twist Throttle
                         /*                 if (ThrottleGrip > GripSensitivity)
@@ -874,19 +1622,19 @@ namespace SaccFlightAndVehicles
                         }
 
                         HandsOnWheel = 0;
-                        float SteerInput = 0;
-                        float VRSteerInput = 0;
+                        _luSteerInput = 0;
+                        _luVRSteerInput = 0;
                         if (!_DisableJoystickControl)
                         {
                             if (SteeringHand_Right)
-                            { RHandSteeringWheel(RGrip, false); }
+                            { RHandSteeringWheel(_luRGrip, false); }
                             if (SteeringHand_Left)
-                            { LHandSteeringWheel(LGrip); }
+                            { LHandSteeringWheel(_luLGrip); }
                             if (InVR)
                             {
                                 if (HandsOnWheel > 0)
                                 {
-                                    VRSteerInput = (VRJoystickPosL + VRJoystickPosR) / (float)HandsOnWheel;
+                                    _luVRSteerInput = (VRJoystickPosL + VRJoystickPosR) / (float)HandsOnWheel;
                                 }
                                 else
                                 {
@@ -895,57 +1643,67 @@ namespace SaccFlightAndVehicles
                             }
                             if (UseStickSteering)
                             {
-                                SteerInput = Ai + Di + Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryThumbstickHorizontal");
+                                _luSteerInput = _luAi + _luDi + Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryThumbstickHorizontal");
                             }
                             else
                             {
-                                SteerInput = -VRSteerInput + Ai + Di;
+                                _luSteerInput = -_luVRSteerInput + _luAi + _luDi;
                             }
                         }
                         //get the average transform movement that the steering wheels are touching
                         LastTouchedTransform_Speed = Vector3.zero;
-                        for (int i = 0; i < SteerWheels.Length; i++)
+                        _luSteerLen2 = SteerWheels.Length;
+                        _luDriveLen2 = DriveWheels.Length;
+                        _luDenom = _luSteerLen2 + _luDriveLen2;
+                        if (_luDenom > 0)
                         {
-                            LastTouchedTransform_Speed += (Vector3)SteerWheels[i].GetProgramVariable("LastTouchedTransform_Speed");
+                            for (_luI = 0; _luI < _luSteerLen2; _luI++)
+                            {
+                                _luWheel = (_luI < _SteerWheelsCount) ? _SteerWheelsTyped[_luI] : null;
+                                if (_luWheel != null) { LastTouchedTransform_Speed += _luWheel.LastTouchedTransform_Speed; }
+                                else if (SteerWheels[_luI] != null) { LastTouchedTransform_Speed += (Vector3)SteerWheels[_luI].GetProgramVariable("LastTouchedTransform_Speed"); }
+                            }
+                            for (_luI = 0; _luI < _luDriveLen2; _luI++)
+                            {
+                                _luWheel = (_luI < _DriveWheelsCount) ? _DriveWheelsTyped[_luI] : null;
+                                if (_luWheel != null) { LastTouchedTransform_Speed += _luWheel.LastTouchedTransform_Speed; }
+                                else if (DriveWheels[_luI] != null) { LastTouchedTransform_Speed += (Vector3)DriveWheels[_luI].GetProgramVariable("LastTouchedTransform_Speed"); }
+                            }
+                            LastTouchedTransform_Speed = LastTouchedTransform_Speed / _luDenom;
                         }
-                        for (int i = 0; i < DriveWheels.Length; i++)
-                        {
-                            LastTouchedTransform_Speed += (Vector3)DriveWheels[i].GetProgramVariable("LastTouchedTransform_Speed");
-                        }
-                        LastTouchedTransform_Speed = LastTouchedTransform_Speed / (SteerWheels.Length + DriveWheels.Length);
-                        float AutoSteer = Vector3.SignedAngle(VehicleTransform.forward, Vector3.ProjectOnPlane(CurrentVel - LastTouchedTransform_Speed, VehicleTransform.up), VehicleTransform.up);
-                        if (Mathf.Abs(AutoSteer) > 110)
-                        { AutoSteer = 0; }
+                        _luAutoSteer = Vector3.SignedAngle(VehicleTransform.forward, Vector3.ProjectOnPlane(CurrentVel - LastTouchedTransform_Speed, VehicleTransform.up), VehicleTransform.up);
+                        if (Mathf.Abs(_luAutoSteer) > 110)
+                        { _luAutoSteer = 0; }
 
-                        { AutoSteer = Mathf.Clamp(AutoSteer / SteeringDegrees, -1, 1); }
+                        { _luAutoSteer = Mathf.Clamp(_luAutoSteer / SteeringDegrees, -1, 1); }
 
-                        float GroundedwheelsRatio = NumGroundedSteerWheels / SteerWheels.Length;
+                        _luGroundedWheelsRatio = (SteerWheels.Length > 0) ? (NumGroundedSteerWheels / SteerWheels.Length) : 0f;
                         if (!_DisableJoystickControl)
                         {
                             if (InVR && !UseStickSteering)
                             {
-                                AutoSteerLerper = Mathf.Lerp(AutoSteerLerper, AutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * GroundedwheelsRatio * DeltaTime));
-                                float YawAddAmount = SteerInput;
-                                if (Mathf.Abs(YawAddAmount) > 0f)
+                                AutoSteerLerper = Mathf.Lerp(AutoSteerLerper, _luAutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * _luGroundedWheelsRatio * _luDeltaTime));
+                                _luYawAddAmount = _luSteerInput;
+                                if (Mathf.Abs(_luYawAddAmount) > 0f)
                                 {
                                     if (Drift_AutoSteer)
                                     {
-                                        YawInput = Mathf.Clamp(AutoSteerLerper + YawAddAmount, -1f, 1f);
+                                        YawInput = Mathf.Clamp(AutoSteerLerper + _luYawAddAmount, -1f, 1f);
                                     }
                                     else
                                     {
-                                        YawInput = YawAddAmount;
+                                        YawInput = _luYawAddAmount;
                                     }
                                 }
                                 else
                                 {
                                     if (Drift_AutoSteer)
                                     {
-                                        YawInput = Mathf.Lerp(YawInput, AutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * GroundedwheelsRatio * DeltaTime));
+                                        YawInput = Mathf.Lerp(YawInput, _luAutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * _luGroundedWheelsRatio * _luDeltaTime));
                                     }
                                     else
                                     {
-                                        YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedVR) * DeltaTime);
+                                        YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedVR) * _luDeltaTime);
                                     }
                                 }
                             }
@@ -953,76 +1711,76 @@ namespace SaccFlightAndVehicles
                             {
                                 if (SteeringMaxSpeedDTDisabled || _HandBrakeOn)//no steering limit when handbarke on
                                 {
-                                    YawInput = Mathf.Clamp(SteerInput, -1, 1);
+                                    YawInput = Mathf.Clamp(_luSteerInput, -1, 1);
                                 }
                                 else
                                 {
-                                    float SpeedSteeringLimitUpper = 1 - (VehicleSpeed / SteeringMaxSpeedDT);
-                                    SpeedSteeringLimitUpper = Mathf.Clamp(SpeedSteeringLimitUpper, DesktopMinSteering, 1);
-                                    float SpeedSteeringLimitLower = -SpeedSteeringLimitUpper;
+                                    _luSpeedSteeringLimitUpper = 1 - (VehicleSpeed / SteeringMaxSpeedDT);
+                                    _luSpeedSteeringLimitUpper = Mathf.Clamp(_luSpeedSteeringLimitUpper, DesktopMinSteering, 1);
+                                    _luSpeedSteeringLimitLower = -_luSpeedSteeringLimitUpper;
 
-                                    if (AutoSteer < 0)
+                                    if (_luAutoSteer < 0)
                                     {
-                                        SpeedSteeringLimitLower = Mathf.Min(SpeedSteeringLimitLower, AutoSteer - DesktopMinSteering);
-                                        YawInput = SteerInput * -SpeedSteeringLimitLower;
+                                        _luSpeedSteeringLimitLower = Mathf.Min(_luSpeedSteeringLimitLower, _luAutoSteer - DesktopMinSteering);
+                                        YawInput = _luSteerInput * -_luSpeedSteeringLimitLower;
                                     }
                                     else
                                     {
-                                        SpeedSteeringLimitUpper = Mathf.Max(SpeedSteeringLimitUpper, AutoSteer + DesktopMinSteering);
-                                        YawInput = SteerInput * SpeedSteeringLimitUpper;
+                                        _luSpeedSteeringLimitUpper = Mathf.Max(_luSpeedSteeringLimitUpper, _luAutoSteer + DesktopMinSteering);
+                                        YawInput = _luSteerInput * _luSpeedSteeringLimitUpper;
                                     }
                                 }
                             }
                             else
                             {
-                                float YawAddAmount = SteerInput * DeltaTime * (1f / SteeringKeyboardSecsToMax);
-                                if (YawAddAmount != 0f)
+                                _luYawAddAmount = _luSteerInput * _luDeltaTime * (1f / SteeringKeyboardSecsToMax);
+                                if (_luYawAddAmount != 0f)
                                 {
                                     if (SteeringMaxSpeedDTDisabled || _HandBrakeOn)//no steering limit when handbarke on
                                     {
-                                        YawInput = Mathf.Clamp(YawInput + YawAddAmount, -1, 1);
+                                        YawInput = Mathf.Clamp(YawInput + _luYawAddAmount, -1, 1);
                                     }
                                     else
                                     {
-                                        float SpeedSteeringLimitUpper = 1 - (VehicleSpeed / SteeringMaxSpeedDT);
-                                        SpeedSteeringLimitUpper = Mathf.Clamp(SpeedSteeringLimitUpper, DesktopMinSteering, 1);
-                                        float SpeedSteeringLimitLower = -SpeedSteeringLimitUpper;
+                                        _luSpeedSteeringLimitUpper = 1 - (VehicleSpeed / SteeringMaxSpeedDT);
+                                        _luSpeedSteeringLimitUpper = Mathf.Clamp(_luSpeedSteeringLimitUpper, DesktopMinSteering, 1);
+                                        _luSpeedSteeringLimitLower = -_luSpeedSteeringLimitUpper;
 
-                                        if (AutoSteer < 0)
+                                        if (_luAutoSteer < 0)
                                         {
-                                            SpeedSteeringLimitLower = Mathf.Min(SpeedSteeringLimitLower, AutoSteer - DesktopMinSteering);
+                                            _luSpeedSteeringLimitLower = Mathf.Min(_luSpeedSteeringLimitLower, _luAutoSteer - DesktopMinSteering);
                                         }
                                         else
                                         {
-                                            SpeedSteeringLimitUpper = Mathf.Max(SpeedSteeringLimitUpper, AutoSteer + DesktopMinSteering);
+                                            _luSpeedSteeringLimitUpper = Mathf.Max(_luSpeedSteeringLimitUpper, _luAutoSteer + DesktopMinSteering);
                                         }
-                                        YawInput = Mathf.Clamp(YawInput + YawAddAmount, SpeedSteeringLimitLower, SpeedSteeringLimitUpper);
+                                        YawInput = Mathf.Clamp(YawInput + _luYawAddAmount, _luSpeedSteeringLimitLower, _luSpeedSteeringLimitUpper);
                                     }
-                                    if ((SteerInput > 0 && YawInput < 0) || SteerInput < 0 && YawInput > 0)
+                                    if ((_luSteerInput > 0 && YawInput < 0) || _luSteerInput < 0 && YawInput > 0)
                                     {
-                                        YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedDT) * DeltaTime);
+                                        YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedDT) * _luDeltaTime);
                                     }
                                 }
                                 else
                                 {
                                     if (Drift_AutoSteer)
-                                    { YawInput = Mathf.Lerp(YawInput, AutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * DeltaTime * GroundedwheelsRatio)); }
+                                    { YawInput = Mathf.Lerp(YawInput, _luAutoSteer, 1 - Mathf.Pow(0.5f, VehicleSpeed * AutoSteerStrength * _luDeltaTime * _luGroundedWheelsRatio)); }
                                     else if (Bike_AutoSteer)
                                     {
-                                        float angle = Vector3.SignedAngle(VehicleTransform.up, Vector3.up, VehicleTransform.forward);
-                                        if (angle != angleLast)
+                                        _luAngle = Vector3.SignedAngle(VehicleTransform.up, Vector3.up, VehicleTransform.forward);
+                                        if (_luAngle != angleLast)
                                         {
                                             // if ((angle > 0 && YawInput < 0) || (angle < 0 && YawInput > 0))
                                             // {
                                             //     YawInput = 0;
                                             // }
-                                            YawInput += angle * Bike_AutoSteer_Strength * Time.deltaTime;
-                                            YawInput *= (angle - angleLast) * Bike_AutoSteer_CounterStrength * Time.deltaTime;
-                                            angleLast = angle;
+                                            YawInput += _luAngle * Bike_AutoSteer_Strength * _luDeltaTime;
+                                            YawInput *= (_luAngle - angleLast) * Bike_AutoSteer_CounterStrength * _luDeltaTime;
+                                            angleLast = _luAngle;
                                         }
                                     }
                                     else
-                                    { YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedDT) * DeltaTime); }
+                                    { YawInput = Mathf.MoveTowards(YawInput, 0f, (1f / SteeringReturnSpeedDT) * _luDeltaTime); }
                                 }
                             }
                             YawInput = Mathf.Clamp(YawInput, -1f, 1f);
@@ -1032,7 +1790,7 @@ namespace SaccFlightAndVehicles
                         {
                             if (InVR)
                             {
-                                ThrottleInput = Mathf.Min(VRThrottlePos + Wi, 1f);
+                                ThrottleInput = Mathf.Min(VRThrottlePos + _luWi, 1f);
                                 /*                                        else
                                                    {
 
@@ -1042,18 +1800,20 @@ namespace SaccFlightAndVehicles
                             }
                             else
                             {
-                                if (Wi != 0)
+                                if (_luWi != 0)
                                 {
-                                    ThrottleInput = Mathf.Clamp(Mathf.MoveTowards(ThrottleInput, VRThrottlePos + (Wi), (1 / ThrottleToMaxTimeDT) * DeltaTime), -DriveSpeedKeyboardMax, DriveSpeedKeyboardMax);
+                                    ThrottleInput = Mathf.Clamp(Mathf.MoveTowards(ThrottleInput, VRThrottlePos + (_luWi), (1 / ThrottleToMaxTimeDT) * _luDeltaTime), -DriveSpeedKeyboardMax, DriveSpeedKeyboardMax);
                                 }
                                 else
                                 {
-                                    ThrottleInput = Mathf.MoveTowards(ThrottleInput, 0f, (1 / ThrottleReturnTimeDT) * DeltaTime);
+                                    ThrottleInput = Mathf.MoveTowards(ThrottleInput, 0f, (1 / ThrottleReturnTimeDT) * _luDeltaTime);
                                 }
                             }
-                            for (int i = 0; i < DriveWheels.Length; i++)
+                            for (_luI = 0; _luI < DriveWheels.Length; _luI++)
                             {
-                                DriveWheels[i].SetProgramVariable("Clutch", Clutch);
+                                _luWheel = (_luI < _DriveWheelsCount) ? _DriveWheelsTyped[_luI] : null;
+                                if (_luWheel != null) { _luWheel.Clutch = Clutch; }
+                                else if (DriveWheels[_luI] != null) { DriveWheels[_luI].SetProgramVariable("Clutch", Clutch); }
                             }
                             FinalThrottle = ThrottleInput;
                         }
@@ -1069,7 +1829,7 @@ namespace SaccFlightAndVehicles
                             FinalThrottle = (MinThrottle - FinalThrottle) * MinThrottle_PStrength;
                             //P Controller for throttle
                         }
-                        Fuel = Mathf.Max(Fuel - (FuelConsumption * Time.deltaTime * (Revs / RevLimiter)), 0);
+                        Fuel = Mathf.Max(Fuel - (FuelConsumption * _luDeltaTime * (Revs / RevLimiter)), 0);
                     }
                     else
                     {
@@ -1088,11 +1848,20 @@ namespace SaccFlightAndVehicles
                 VehiclePosLastFrame = VehicleTransform.position;
                 MovingForward = Vector3.Dot(VehicleTransform.forward, CurrentVel) < 0f;
             }
+
+            if (IsOwner)
+            {
+                _MaybeRequestSerialization();
+            }
         }
         public void UpdateGearRatio()
         {
-            for (int i = 0; i < DriveWheels.Length; i++)
-            { DriveWheels[i].SetProgramVariable("_GearRatio", GearRatio); }
+            for (_ugI = 0; _ugI < DriveWheels.Length; _ugI++)
+            {
+                _ugWheel = (_ugI < _DriveWheelsCount) ? _DriveWheelsTyped[_ugI] : null;
+                if (_ugWheel != null) { _ugWheel.GearRatio = GearRatio; }
+                else if (DriveWheels[_ugI] != null) { DriveWheels[_ugI].SetProgramVariable("_GearRatio", GearRatio); }
+            }
         }
         float Steps_Error;
         [System.NonSerialized] public float GsAveragingTime = .1f;
@@ -1103,17 +1872,81 @@ namespace SaccFlightAndVehicles
         private void FixedUpdate()
         {
             if (!IsOwner) { return; }
-            float DeltaTime = Time.fixedDeltaTime;
-            Vector3 absVel = VehicleRigidbody.velocity;
-            CurrentVel = absVel - LastTouchedTransform_Speed;
+            if (_physicsReinitInProgress) { return; }
+
+            // Defensive: ensure we never execute more than once per physics step.
+            // If something causes duplicated callbacks, double-applying wheel forces will explode.
+            if (Mathf.Abs(Time.fixedTime - _lastVehicleFixedTime) < 0.00001f) { return; }
+            _lastVehicleFixedTime = Time.fixedTime;
+
+            // Big perf win: if the vehicle is unoccupied and has settled, stop doing per-wheel raycasts/forces.
+            // This allows PhysX to sleep naturally instead of being kept awake by tiny corrective forces.
+            if (IdleAtRestOptimization && !Piloting && !Occupied && !Passenger && VehicleRigidbody != null && !VehicleRigidbody.isKinematic)
+            {
+                _iatroV = VehicleRigidbody.velocity;
+                _iatroAV = VehicleRigidbody.angularVelocity;
+                _iatroVSqr = _iatroV.sqrMagnitude;
+                _iatroAVSqr = _iatroAV.sqrMagnitude;
+                _iatroVThr = IdleAtRestSpeedThreshold;
+                _iatroAVThr = IdleAtRestAngularSpeedThreshold;
+                _iatroVThrSqr = _iatroVThr * _iatroVThr;
+                _iatroAVThrSqr = _iatroAVThr * _iatroAVThr;
+
+                if (_iatroVSqr <= _iatroVThrSqr && _iatroAVSqr <= _iatroAVThrSqr)
+                {
+                    _iatroNow = Time.time;
+                    if (_idleAtRestSince <= 0f) { _idleAtRestSince = _iatroNow; }
+                    if ((_iatroNow - _idleAtRestSince) >= IdleAtRestDelay)
+                    {
+                        // Put wheels to sleep once so they stop LateUpdate FX/visual work too.
+                        if (!_idleAtRestWheelsSlept && AllWheels != null)
+                        {
+                            _idleAtRestWheelsSlept = true;
+                            for (int i = 0; i < AllWheels.Length; i++)
+                            {
+                                if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("FallAsleep"); }
+                            }
+                        }
+
+                        // Keep local state consistent for anything reading these while idle.
+                        CurrentVel = Vector3.zero;
+                        VehicleSpeed = 0f;
+                        VehicleRigidbody.Sleep();
+                        return;
+                    }
+                }
+                else
+                {
+                    _idleAtRestSince = 0f;
+
+                    // If we were in idle sleep, wake wheels back up immediately when motion resumes.
+                    if (_idleAtRestWheelsSlept && AllWheels != null)
+                    {
+                        _idleAtRestWheelsSlept = false;
+                        for (int i = 0; i < AllWheels.Length; i++)
+                        {
+                            if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("WakeUp"); }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                _idleAtRestSince = 0f;
+                _idleAtRestWheelsSlept = false;
+            }
+
+            _fuDeltaTime = Time.fixedDeltaTime;
+            _fuAbsVel = VehicleRigidbody.velocity;
+            CurrentVel = _fuAbsVel - LastTouchedTransform_Speed;
             //calc Gs
-            float gravity = 9.81f * DeltaTime;
-            LastFrameVel.y -= gravity;
-            Vector3 Gs3 = VehicleTransform.InverseTransformDirection(CurrentVel - LastFrameVel);
-            Vector3 thisFrameGs = Gs3 / gravity;
+            _fuGravity = 9.81f * _fuDeltaTime;
+            LastFrameVel.y -= _fuGravity;
+            _fuGs3 = VehicleTransform.InverseTransformDirection(CurrentVel - LastFrameVel);
+            _fuThisFrameGs = _fuGs3 / _fuGravity;
             Gs_all -= FrameGs[GsFrameCheck];
-            Gs_all += thisFrameGs;
-            FrameGs[GsFrameCheck] = thisFrameGs;
+            Gs_all += _fuThisFrameGs;
+            FrameGs[GsFrameCheck] = _fuThisFrameGs;
             GsFrameCheck++;
             if (GsFrameCheck >= NumFUinAvgTime) { GsFrameCheck = 0; }
             AllGs = Gs_all.magnitude / NumFUinAvgTime;
@@ -1124,25 +1957,25 @@ namespace SaccFlightAndVehicles
 #if UNITY_EDITOR
                 revUpDT = 1f / NumStepsSec; // so adjusting in play mode works
 #endif
-                double engineTimeDif = Time.fixedTimeAsDouble - engineTime;
+                _fuEngineTimeDif = Time.fixedTimeAsDouble - engineTime;
                 // works out the number of steps, 
-                int numupdates = (int)(engineTimeDif / revUpDT);
+                _fuNumUpdates = (int)(_fuEngineTimeDif / revUpDT);
                 // make sure its even (if doing too many, less will be done next frame so it's okay)
-                if (numupdates % 2 != 0)
-                { numupdates++; }
+                if (_fuNumUpdates % 2 != 0)
+                { _fuNumUpdates++; }
                 // because the for loop starts at 0, the middle update is one less
-                int middleUpdate = (int)(numupdates / 2) - 1;
-                bool WheelUpdateDone = false;
-                for (int i = 0; i < numupdates; i++)
+                _fuMiddleUpdate = (int)(_fuNumUpdates / 2) - 1;
+                _fuWheelUpdateDone = false;
+                for (_fuI = 0; _fuI < _fuNumUpdates; _fuI++)
                 {
                     RevUp(); // increases revs based on EngineResponseCurve
-                    if (!WheelUpdateDone)
+                    if (!_fuWheelUpdateDone)
                     {
-                        if (i == middleUpdate)
+                        if (_fuI == _fuMiddleUpdate)
                         {
                             // Apply EngineForceUsed at the middle step (that's why we needed an even number)
                             // This is required when applying delta time when iterating over a curve (integrals with deltatime)
-                            WheelUpdateDone = true;
+                            _fuWheelUpdateDone = true;
                             Revs = Mathf.Max(Revs - EngineForceUsed, 0);
                             EngineForceUsed = 0;
                         }
@@ -1151,13 +1984,81 @@ namespace SaccFlightAndVehicles
             }
             else
             {
-                Revs = Mathf.Max(Mathf.Lerp(Revs, 0f, 1 - Mathf.Pow(0.5f, DeltaTime * EngineSlowDown)), 0f);
+                Revs = Mathf.Max(Mathf.Lerp(Revs, 0f, 1 - Mathf.Pow(0.5f, _fuDeltaTime * EngineSlowDown)), 0f);
             }
-            for (int i = 0; i < AllWheels.Length; i++)
-            { AllWheels[i].SendCustomEvent("Wheel_FixedUpdate"); }//EngineForceUsed is updated in this function
+            for (_fuI = 0; _fuI < AllWheels.Length; _fuI++)
+            { AllWheels[_fuI].SendCustomEvent("Wheel_FixedUpdate"); }//EngineForceUsed is updated in this function
 
-            VehicleRigidbody.velocity = Vector3.Lerp(VehicleRigidbody.velocity, Vector3.zero, 1 - Mathf.Pow(0.5f, Drag * DeltaTime));
+            VehicleRigidbody.velocity = Vector3.Lerp(VehicleRigidbody.velocity, Vector3.zero, 1 - Mathf.Pow(0.5f, Drag * _fuDeltaTime));
         }
+
+        [System.NonSerialized] private float _lastVehicleFixedTime = -999f;
+
+        // UdonSharp CPU: cached temps for LateUpdate/UpdateGearRatio/FixedUpdate (avoid local declarations).
+        private float _luDeltaTime;
+        private int _luSteerLen;
+        private int _luDriveLen;
+        private int _luOtherLen;
+        private int _luI;
+        private SaccWheel _luWheel;
+
+        private int _ugI;
+        private SaccWheel _ugWheel;
+
+        private float _fuDeltaTime;
+        private Vector3 _fuAbsVel;
+        private float _fuGravity;
+        private Vector3 _fuGs3;
+        private Vector3 _fuThisFrameGs;
+        private double _fuEngineTimeDif;
+        private int _fuNumUpdates;
+        private int _fuMiddleUpdate;
+        private bool _fuWheelUpdateDone;
+        private int _fuI;
+
+        // UdonSharp CPU: cached temps for LateUpdate input/leaning/steering (avoid local declarations).
+        private Vector2 _luStickPos;
+        private float _luStickAngle;
+        private float _luForwardAmount;
+        private float _luReverseSpeedL;
+        private float _luReverseSpeedR;
+        private float _luLGearRatio;
+        private float _luRGearRatio;
+        private float _luLeftThrottle;
+        private float _luRightThrottle;
+        private int _luWi;
+        private int _luAi;
+        private int _luDi;
+        private float _luLGrip;
+        private float _luRGrip;
+        private int _luThreei;
+        private int _luRi;
+        private float _luVRLean;
+        private float _luVRLeanPitch;
+        private VRCPlayerApi _luLp;
+        private Vector3 _luHeadLean;
+        private Vector3 _luHeadLeanRoll;
+        private Vector3 _luHeadOffset;
+        private float _luSteerInput;
+        private float _luVRSteerInput;
+        private int _luSteerLen2;
+        private int _luDriveLen2;
+        private int _luDenom;
+        private float _luAutoSteer;
+        private float _luGroundedWheelsRatio;
+        private float _luYawAddAmount;
+        private float _luSpeedSteeringLimitUpper;
+        private float _luSpeedSteeringLimitLower;
+        private float _luAngle;
+
+        private const float _OwnerLateUpdateInterval = 1f / 60f;
+        private const float _NonOwnerLateUpdateInterval = 1f / 20f;
+        [System.NonSerialized] private float _luTickNow;
+        [System.NonSerialized] private float _nextOwnerLateUpdateTime;
+        [System.NonSerialized] private float _nextNonOwnerLateUpdateTime;
+        [System.NonSerialized] private float _lastOwnerLateUpdateTime;
+        [System.NonSerialized] private float _lastNonOwnerLateUpdateTime;
+        [System.NonSerialized] private bool _lateUpdateWasOwner;
         [System.NonSerialized] public float EngineForceUsed;
         float revUpDT;
         double engineTime;
@@ -1214,6 +2115,7 @@ namespace SaccFlightAndVehicles
                 ThrottleInput = 0;
                 Fuel = FullFuel;
                 EntityControl.SendEventToExtensions("SFEXT_O_Explode");
+                _ForceRequestSerialization();
                 SendCustomEventDelayedSeconds(nameof(MoveToSpawn), RespawnDelay - 3);
             }
 
@@ -1278,19 +2180,49 @@ namespace SaccFlightAndVehicles
         public void MoveToSpawn()
         {
             PlayerThrottle = 0;//for editor test mode
-            VehicleRigidbody.angularVelocity = Vector3.zero;
-            VehicleRigidbody.velocity = Vector3.zero;
+            if (VehicleRigidbody != null)
+            {
+                if (!VehicleRigidbody.isKinematic)
+                {
+                    VehicleRigidbody.angularVelocity = Vector3.zero;
+                    VehicleRigidbody.velocity = Vector3.zero;
+                }
+                else
+                {
+                    VehicleRigidbody.Sleep();
+                }
+            }
             //these could get set after death by lag, probably
             Health = FullHealth;
             SetRespawnPos();
             EntityControl.SendEventToExtensions("SFEXT_O_MoveToSpawn");
         }
+
+        private void _ResetAllWheelsAfterTeleport()
+        {
+            if (AllWheels == null) { return; }
+            for (int i = 0; i < AllWheels.Length; i++)
+            {
+                if (AllWheels[i] != null)
+                {
+                    // SaccWheel.ResetAfterTeleport()
+                    AllWheels[i].SendCustomEvent("ResetAfterTeleport");
+                }
+            }
+        }
         public void SetRespawnPos()
         {
             VehicleRigidbody.drag = 0;
             VehicleRigidbody.angularDrag = 0;
-            VehicleRigidbody.angularVelocity = Vector3.zero;
-            VehicleRigidbody.velocity = Vector3.zero;
+            if (!VehicleRigidbody.isKinematic)
+            {
+                VehicleRigidbody.angularVelocity = Vector3.zero;
+                VehicleRigidbody.velocity = Vector3.zero;
+            }
+            else
+            {
+                VehicleRigidbody.Sleep();
+            }
             if (InEditor || UsingManualSync)
             {
                 VehicleTransform.localPosition = EntityControl.Spawnposition;
@@ -1309,6 +2241,10 @@ namespace SaccFlightAndVehicles
                 VehicleRigidbody.position = VehicleTransform.position;
                 VehicleRigidbody.rotation = VehicleTransform.rotation;
             }
+
+            // Critical: after any teleport/respawn, wheel scripts must clear cached ground/contact state
+            // or they can apply extreme suspension/grip forces and get stuck skidding.
+            _ResetAllWheelsAfterTeleport();
         }
         public void NotDead()
         {
@@ -1340,6 +2276,7 @@ namespace SaccFlightAndVehicles
                 YawInput = 0;
                 AutoSteerLerper = 0;
                 SetRespawnPos();
+                _ForceRequestSerialization();
             }
             EntityControl.dead = true;
             SendCustomEventDelayedSeconds(nameof(NotDead), InvincibleAfterSpawn);
@@ -1348,15 +2285,69 @@ namespace SaccFlightAndVehicles
         {
             IsOwner = true;
             AllGs = 0;
+
+            // Ownership handoff can leave PhysX/wheel contact caches in a bad state (especially if the
+            // previous owner exited and the vehicle went to sleep). When the new owner begins simulating,
+            // stale wheel state can apply extreme forces and cause the vehicle to launch or sink.
+            // Stabilize by syncing RB pose, clearing wheel caches, and zeroing near-rest velocities.
+            if (VehicleRigidbody != null && VehicleTransform != null)
+            {
+                if (Sleeping)
+                {
+                    // Ensures gravity/wheels are re-enabled.
+                    SFEXT_L_WakeUp();
+                }
+
+                VehicleRigidbody.useGravity = true;
+                VehicleRigidbody.WakeUp();
+
+                // Ensure rigidbody pose matches the visible transform before sim starts.
+                VehicleRigidbody.position = VehicleTransform.position;
+                VehicleRigidbody.rotation = VehicleTransform.rotation;
+                Physics.SyncTransforms();
+
+                // Clear cached wheel ground/contact state to avoid impulse spikes.
+                _ResetAllWheelsAfterTeleport();
+
+                if (!VehicleRigidbody.isKinematic)
+                {
+                    Vector3 v = VehicleRigidbody.velocity;
+                    Vector3 av = VehicleRigidbody.angularVelocity;
+                    if (Sleeping || (v.sqrMagnitude < 0.01f && av.sqrMagnitude < 0.01f))
+                    {
+                        VehicleRigidbody.velocity = Vector3.zero;
+                        VehicleRigidbody.angularVelocity = Vector3.zero;
+                    }
+                    CurrentVel = VehicleRigidbody.velocity;
+                    LastFrameVel = CurrentVel;
+                }
+                VehiclePosLastFrame = VehicleTransform.position;
+            }
+
+            // Manual sync is particularly sensitive to stale physics/contact state during ownership handoff.
+            // Do a short RB reinit (freeze for a few frames) so the first owner-simulated steps don't explode.
+            if (UsingManualSync && !_physicsReinitInProgress && VehicleRigidbody != null && VehicleTransform != null)
+            {
+                _physicsReinitWasForOwnership = true;
+                int prevDelay = _physicsReinitDelayFrames;
+                _physicsReinitDelayFrames = 6;
+                _BeginPhysicsReinit();
+                _physicsReinitDelayFrames = prevDelay;
+            }
+
             UpdateWheelIsOwner();
             for (int i = 0; i < NumFUinAvgTime; i++) { FrameGs[i] = Vector3.zero; }
             SetupGCalcValues();
+            _MarkNetworkDirty();
+            _nextManualSyncTime = 0f;
+            _ForceRequestSerialization();
         }
         public void SFEXT_O_LoseOwnership()
         {
             VehiclePosLastFrame = VehicleTransform.position;
             IsOwner = false;
             UpdateWheelIsOwner();
+            _InitRemoteInputSmoothingFromCurrent();
         }
         public void UpdateWheelIsOwner()
         {
@@ -1391,11 +2382,23 @@ namespace SaccFlightAndVehicles
         public void SetWheelDriver()
         {
             for (int i = 0; i < DriveWheels.Length; i++)
-            { DriveWheels[i].SetProgramVariable("Piloting", Piloting); }
+            {
+                SaccWheel w = (i < _DriveWheelsCount) ? _DriveWheelsTyped[i] : null;
+                if (w != null) { w.Piloting = Piloting; }
+                else if (DriveWheels[i] != null) { DriveWheels[i].SetProgramVariable("Piloting", Piloting); }
+            }
             for (int i = 0; i < SteerWheels.Length; i++)
-            { SteerWheels[i].SetProgramVariable("Piloting", Piloting); }
+            {
+                SaccWheel w = (i < _SteerWheelsCount) ? _SteerWheelsTyped[i] : null;
+                if (w != null) { w.Piloting = Piloting; }
+                else if (SteerWheels[i] != null) { SteerWheels[i].SetProgramVariable("Piloting", Piloting); }
+            }
             for (int i = 0; i < OtherWheels.Length; i++)
-            { OtherWheels[i].SetProgramVariable("Piloting", Piloting); }
+            {
+                SaccWheel w = (i < _OtherWheelsCount) ? _OtherWheelsTyped[i] : null;
+                if (w != null) { w.Piloting = Piloting; }
+                else if (OtherWheels[i] != null) { OtherWheels[i].SetProgramVariable("Piloting", Piloting); }
+            }
         }
         /*     public void SetWheelSGV()
             {
@@ -1429,6 +2432,20 @@ namespace SaccFlightAndVehicles
             SetCollidersLayer(EntityControl.OnboardVehicleLayer);
             SetWheelDriver();
             SetupGCalcValues();
+
+            // Manual sync: ensure the local owner is actually simulating physics.
+            // This is a last-resort unfreeze in case a prior ownership handoff left the RB kinematic.
+            if (UsingManualSync && IsOwner && VehicleRigidbody != null)
+            {
+                VehicleRigidbody.detectCollisions = true;
+                VehicleRigidbody.isKinematic = false;
+                VehicleRigidbody.useGravity = true;
+                VehicleRigidbody.WakeUp();
+            }
+
+            _MarkNetworkDirty();
+            _nextManualSyncTime = 0f;
+            _ForceRequestSerialization();
         }
         public void SFEXT_O_PilotExit()
         {
@@ -1440,15 +2457,23 @@ namespace SaccFlightAndVehicles
             System.Array.Clear(TankThrottles, 0, 2);
             for (int i = 0; i < DriveWheels.Length; i++)
             {
-                DriveWheels[i].SetProgramVariable("EngineRevs", 0f);
+                SaccWheel w = (i < _DriveWheelsCount) ? _DriveWheelsTyped[i] : null;
+                if (w != null) { w.EngineRevs = 0f; }
+                else if (DriveWheels[i] != null) { DriveWheels[i].SetProgramVariable("EngineRevs", 0f); }
             }
             for (int i = 0; i < SteerWheels.Length; i++)
             {
-                SteerWheels[i].SetProgramVariable("EngineRevs", 0f);//for TankMode
+                SaccWheel w = (i < _SteerWheelsCount) ? _SteerWheelsTyped[i] : null;
+                if (w != null) { w.EngineRevs = 0f; }
+                else if (SteerWheels[i] != null) { SteerWheels[i].SetProgramVariable("EngineRevs", 0f); }//for TankMode
             }
             SetCollidersLayer(EntityControl.OutsideVehicleLayer);
             if (!EntityControl.MySeatIsExternal) { localPlayer.SetVelocity(CurrentVel); }
             SetWheelDriver();
+
+            _MarkNetworkDirty();
+            _nextManualSyncTime = 0f;
+            _ForceRequestSerialization();
         }
         public void SFEXT_P_PassengerEnter()
         {
@@ -1472,16 +2497,42 @@ namespace SaccFlightAndVehicles
         public void SFEXT_L_FallAsleep()
         {
             VehicleRigidbody.useGravity = false;
-            CurrentVel = LastFrameVel = VehicleRigidbody.velocity = Vector3.zero;
-            VehicleRigidbody.angularVelocity = Vector3.zero;
+            if (!VehicleRigidbody.isKinematic)
+            {
+                CurrentVel = LastFrameVel = VehicleRigidbody.velocity = Vector3.zero;
+                VehicleRigidbody.angularVelocity = Vector3.zero;
+            }
+            else
+            {
+                CurrentVel = LastFrameVel = Vector3.zero;
+                VehicleRigidbody.Sleep();
+            }
             VehicleSpeed = 0;
             Sleeping = true;
+
+            // Ensure wheel scripts stop applying forces and reset skid/effect state.
+            if (AllWheels != null)
+            {
+                for (int i = 0; i < AllWheels.Length; i++)
+                {
+                    if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("FallAsleep"); }
+                }
+            }
         }
         public void SFEXT_L_WakeUp()
         {
             VehicleRigidbody.WakeUp();
             VehicleRigidbody.useGravity = true;
             Sleeping = false;
+
+            // Re-enable wheel physics after wake.
+            if (AllWheels != null)
+            {
+                for (int i = 0; i < AllWheels.Length; i++)
+                {
+                    if (AllWheels[i] != null) { AllWheels[i].SendCustomEvent("WakeUp"); }
+                }
+            }
         }
         float LastHitTime = -100, PredictedHealth;
         public void SFEXT_L_BulletHit()
@@ -1609,12 +2660,35 @@ namespace SaccFlightAndVehicles
         }
         public void CheckDistance()
         {
-            CurrentDistance = Vector3.Distance(localPlayer.GetPosition(), CenterOfMass.position);
+            if (!_checkDistanceLoopActive) { return; }
+
+            // In VRChat runtime, calling GetPosition() on an invalid/suspended player can throw an Udon extern exception.
+            // Also guard against CenterOfMass not being initialized yet.
+            VRCPlayerApi lp = Networking.LocalPlayer;
+            if (!Utilities.IsValid(lp) || lp.isSuspended || CenterOfMass == null)
+            {
+                if (_checkDistanceLoopActive) { SendCustomEventDelayedSeconds(nameof(CheckDistance), 2); }
+                return;
+            }
+
+            CurrentDistance = Vector3.Distance(lp.GetPosition(), CenterOfMass.position);
             if (CurrentDistance > DistantRange)
             {
                 if (!CurrentlyDistant)
                 {
                     CurrentlyDistant = true;
+
+                    // Wheels gate skid FX on their own CurrentlyDistant flag; keep them in sync.
+                    if (AllWheels != null)
+                    {
+                        for (int i = 0; i < AllWheels.Length; i++)
+                        {
+                            UdonSharpBehaviour w = AllWheels[i];
+                            if (w == null) { continue; }
+                            w.SetProgramVariable("CurrentlyDistant", true);
+                        }
+                    }
+
                     EntityControl.SendEventToExtensions("SFEXT_L_BecomeDistant");
                 }
             }
@@ -1623,10 +2697,22 @@ namespace SaccFlightAndVehicles
                 if (CurrentlyDistant)
                 {
                     CurrentlyDistant = false;
+
+                    // Wheels gate skid FX on their own CurrentlyDistant flag; keep them in sync.
+                    if (AllWheels != null)
+                    {
+                        for (int i = 0; i < AllWheels.Length; i++)
+                        {
+                            UdonSharpBehaviour w = AllWheels[i];
+                            if (w == null) { continue; }
+                            w.SetProgramVariable("CurrentlyDistant", false);
+                        }
+                    }
+
                     EntityControl.SendEventToExtensions("SFEXT_L_NotDistant");
                 }
             }
-            SendCustomEventDelayedSeconds(nameof(CheckDistance), 2);
+            if (_checkDistanceLoopActive) { SendCustomEventDelayedSeconds(nameof(CheckDistance), 2); }
         }
         public void SetCollidersLayer(int NewLayer)
         {
@@ -1652,6 +2738,11 @@ namespace SaccFlightAndVehicles
         }
         void RHandSteeringWheel(float RGrip, bool isReGrab)
         {
+            if (!Utilities.IsValid(localPlayer) || localPlayer.isSuspended)
+            {
+                VRJoystickPosR = 0f;
+                return;
+            }
             bool GrabbingR = RGrip > GripSensitivity;
             if (GrabbingR)
             {
@@ -1726,6 +2817,11 @@ namespace SaccFlightAndVehicles
         }
         void LHandSteeringWheel(float LGrip)
         {
+            if (!Utilities.IsValid(localPlayer) || localPlayer.isSuspended)
+            {
+                VRJoystickPosL = 0f;
+                return;
+            }
             //Toggle gripping the steering wheel if double tap grab
             bool GrabbingL = LGrip > GripSensitivity;
             if (GrabbingL)
